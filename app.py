@@ -927,7 +927,7 @@ class Handler(SimpleHTTPRequestHandler):
         self.close_connection = True
         self._gone = False
         try:
-            self.wfile.write(b": stream open\n\n")
+            self.wfile.write(b": stream open\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):
             self._gone = True
@@ -937,7 +937,7 @@ class Handler(SimpleHTTPRequestHandler):
             return
         try:
             payload = json.dumps(data, ensure_ascii=False)
-            self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+            self.wfile.write(f"data: {payload}\n".encode("utf-8"))
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):
             self._gone = True
