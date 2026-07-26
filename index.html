@@ -70,7 +70,7 @@ body::before{
 
 /* ---------- query bar ---------- */
 .querybar{border:1px solid var(--border);background:linear-gradient(180deg,var(--panel2),var(--panel));
-  border-radius:var(--r);padding:16px 18px;margin-bottom:16px;position:sticky;top:18px;z-index:30;overflow:hidden}
+  border-radius:var(--r);padding:16px 18px;margin-bottom:16px;position:relative;overflow:hidden}
 .querybar::after{content:"";position:absolute;inset:0;border-radius:var(--r);pointer-events:none;
   box-shadow:inset 0 1px 0 rgba(255,255,255,.03)}
 .qb-main{display:flex;align-items:center;gap:14px}
@@ -197,7 +197,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
   padding:2px 0 2px 11px;margin-bottom:12px}
 .ev-intro[hidden]{display:none}
 .ev-count{font-size:11px;color:var(--dim);letter-spacing:.06em}
-.ev-list{display:flex;flex-direction:column;gap:12px;padding-right:4px}
+.ev-list{display:flex;flex-direction:column;gap:12px;max-height:66vh;overflow:auto;padding-right:4px}
 .ev-card{display:grid;grid-template-columns:3px 1fr;border:1px solid var(--border);border-radius:11px;
   background:var(--panel2);overflow:hidden;transition:.2s;animation:rise .35s ease both}
 .ev-card:hover{border-color:var(--border2);transform:translateY(-1px)}
@@ -313,8 +313,8 @@ input[type=range]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;bac
     </div>
     <div class="status">
       <span class="pill" id="pillIndex"><i class="dot"></i>INDEX <b>0</b></span>
-      <span class="pill"><i class="dot on"></i>EMBED <b>bundled</b></span>
-      <span class="pill"><i class="dot on"></i>RERANK <b>bundled</b></span>
+      <span class="pill" id="pillEmbed"><i class="dot on"></i>EMBED <b>bundled</b></span>
+      <span class="pill" id="pillRerank"><i class="dot on"></i>RERANK <b>bundled</b></span>
       <span class="pill" id="pillLm"><i class="dot"></i>LM STUDIO <b>—</b></span>
       <button class="gear" id="openSettings" title="Settings">⚙</button>
     </div>
@@ -392,6 +392,35 @@ input[type=range]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;bac
           <button class="mini" id="refreshAnswer" title="Refresh">↻</button>
         </div>
       </div>
+    </div>
+
+    <div class="set-sec">
+      <h3>Local models — embedding &amp; reranker</h3>
+      <div class="hint" style="margin:0 0 12px">These run locally via the bundled llama-server. Models whose context is too small for the current passage size are greyed out, and the engine auto-selects the next larger one.</div>
+
+      <div class="set-row col">
+        <label>Embedding model <span class="hint">— vectorises passages. Changing this needs a full re-index.</span></label>
+        <div class="row-cluster">
+          <select id="embedModelSel"></select>
+          <button class="mini primary" id="embedDownload">Download</button>
+          <button class="mini" id="embedApply">Apply</button>
+        </div>
+        <span class="hint" id="embedModelInfo"></span>
+      </div>
+
+      <div class="set-row col">
+        <label>Reranker model <span class="hint">— re-scores retrieved passages. No re-index needed.</span></label>
+        <div class="row-cluster">
+          <select id="rerankModelSel"></select>
+          <button class="mini primary" id="rerankDownload">Download</button>
+          <button class="mini" id="rerankApply">Apply</button>
+        </div>
+        <span class="hint" id="rerankModelInfo"></span>
+      </div>
+
+      <div class="set-row" style="margin-top:6px"><label>Server status</label><span class="hint" id="localServerStatus">checking…</span></div>
+      <div class="bar"><i id="modelDlBar"></i></div>
+      <span id="modelDlText" class="hint"></span>
     </div>
 
     <div class="set-sec">
@@ -816,6 +845,87 @@ function loadModel(key){
     .catch(e=>{ toast("Load failed: "+e.message,"err"); });
 }
 
+/* ---------- local models (embed + rerank) ---------- */
+let localCatalog=[], localSel={embedding:"",reranker:""}, localServers={};
+const embedSel=$("embedModelSel"), rerankSel=$("rerankModelSel");
+const ctxLabel=m=>{const c=m.ctx||0;return c>=1024?(c/1024)+"k ctx":c+" ctx";};
+function modelThreshold(kind,m){
+  const srv=localServers[kind];
+  if(srv && srv.file===m.id && srv.effective_ctx) return srv.max_chars;  // live effective ctx
+  return m.max_chars;                                                     // nominal ctx
+}
+function setPill(id,ok,label){const p=$(id);if(!p)return;p.querySelector(".dot").className="dot "+(ok?"on":"warn");if(label!=null)p.querySelector("b").textContent=label;}
+function renderLocalServerStatus(){
+  const e=localServers.embedding||{}, r=localServers.reranker||{};
+  const dot=st=>st==="ok"?"🟢":(st==="starting"||st==="loading")?"🟡":st==="missing"?"⚪":"🔴";
+  $("localServerStatus").textContent="embed "+(dot(e.state)||"")+" "+(e.state||"off")+"   ·   rerank "+(dot(r.state)||"")+" "+(r.state||"off");
+  setPill("pillEmbed",e.state==="ok",e.state==="ok"?"on":(e.state||"off"));
+  setPill("pillRerank",r.state==="ok",r.state==="ok"?"on":(r.state||"off"));
+}
+function renderLocalModels(){
+  const chunk=+val("chunkSize")||0;
+  [["embedding",embedSel],["reranker",rerankSel]].forEach(([kind,sel])=>{
+    const list=localCatalog.filter(m=>m.kind===kind).slice().sort((a,b)=>(a.ctx||0)-(b.ctx||0));
+    const fits=m=>chunk<=modelThreshold(kind,m);
+    let chosen=localSel[kind];
+    let current=list.find(m=>m.id===chosen);
+    if(!current || !fits(current)){
+      const fitting=list.filter(fits);
+      const pick=fitting.find(m=>m.downloaded)||fitting[0];
+      if(pick){ if(chosen&&current) toast("Auto-switched "+kind+" → "+pick.name+" (fits "+chunk+"-char passages)","ok"); chosen=pick.id; }
+    }
+    sel.innerHTML="";
+    list.forEach(m=>{
+      const ok=fits(m);
+      const label=m.name+"  ·  "+ctxLabel(m)+(m.downloaded?"":"  ·  ⬇ not downloaded")+(ok?"":"  ·  too small for "+chunk+"-char passages");
+      const o=el("option",{value:m.id,text:label}); if(!ok)o.disabled=true; sel.appendChild(o);
+    });
+    sel.value=Array.from(sel.options).some(o=>o.value===chosen&&!o.disabled)?chosen:(sel.options[0]?sel.options[0].value:"");
+    localSel[kind]=sel.value;
+    const info=$(kind==="embedding"?"embedModelInfo":"rerankModelInfo");
+    const m=list.find(x=>x.id===sel.value); const srv=localServers[kind]||{};
+    if(info&&m){const eff=(srv.file===m.id&&srv.effective_ctx)?srv.effective_ctx:m.ctx;
+      info.textContent=(m.downloaded?"✓ downloaded":"not downloaded")+" · ctx "+(eff||"?")+" · fits passages ≤ "+modelThreshold(kind,m)+" chars"+(srv.state?" · server: "+srv.state:"");}
+  });
+  renderLocalServerStatus();
+}
+function fetchLocalModels(){
+  return fetch("/api/local-models").then(r=>r.json()).then(d=>{
+    localCatalog=d.catalog||[]; localSel=d.selection||{embedding:"",reranker:""}; localServers=d.servers||{};
+    renderLocalModels();
+  }).catch(()=>{ $("localServerStatus").textContent="local model API unavailable"; });
+}
+function applyLocalModel(kind){
+  const sel=kind==="embedding"?embedSel:rerankSel; const id=sel.value;
+  const m=localCatalog.find(x=>x.id===id);
+  if(!m){toast("Pick a model first.","err");return;}
+  if(!m.downloaded){toast("Downloading "+m.name+" first…","info");downloadLocalModel(kind);return;}
+  toast("Switching "+kind+" model…","info");
+  fetch("/api/select-local-model",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({kind,id})})
+    .then(r=>r.json().then(d=>({status:r.status,d})))
+    .then(({status,d})=>{
+      if(d&&d.success){toast(kind+" model loaded ✓","ok");
+        if(d.reindex_required)toast("Embedding changed: vectors are model-specific → run “Rebuild from scratch”.","err");}
+      else toast("Switch failed: "+((d&&d.error)||("HTTP "+status)),"err");
+      fetchLocalModels(); refreshStatus();
+    }).catch(e=>toast("Switch failed: "+e.message,"err"));
+}
+function downloadLocalModel(kind){
+  const sel=kind==="embedding"?embedSel:rerankSel; const id=sel.value;
+  const m=localCatalog.find(x=>x.id===id);
+  if(!m){toast("Pick a model to download.","err");return;}
+  if(m.downloaded){toast(m.name+" already downloaded.","ok");return;}
+  const bar=$("modelDlBar"),txt=$("modelDlText"); bar.style.width="2%"; txt.textContent="Downloading "+m.name+"…";
+  fetch("/api/download-model",{method:"POST",headers:{"Content-Type":"application/json","Accept":"text/event-stream"},body:JSON.stringify({id})})
+    .then(resp=>{ if(!resp.ok){toast("Download failed","err");bar.style.width="0";txt.textContent="";return;}
+      return readStream(resp,e=>{
+        if(e.type==="progress"){bar.style.width=(e.percent||0)+"%";txt.textContent="Downloading "+m.name+" — "+(e.mb_done||0)+" / "+(e.mb_total||"?")+" MB";}
+        else if(e.type==="error"){toast(e.error||"Download error","err");txt.textContent=e.error||"";}
+        else if(e.type==="done"){bar.style.width="100%";txt.textContent="Done.";toast(m.name+" downloaded ✓","ok");setTimeout(()=>{bar.style.width="0";txt.textContent="";},1500);fetchLocalModels();}
+      });
+    }).catch(e=>{toast(e.message,"err");txt.textContent="";});
+}
+
 /* ---------- settings ---------- */
 function setSwitch(id,on){ $(id).classList.toggle("on",!!on); }
 const switchOn=id=>$(id).classList.contains("on");
@@ -851,6 +961,7 @@ function openSettings(){
     const fsel=$("folderSel"); fsel.innerHTML="";
     (opt.folders||[]).forEach(f=>fsel.appendChild(el("option",{value:f.value,text:f.label||f.value})));
     fillSettings(s);
+    fetchLocalModels();
   });
 }
 function closeSettings(){ settingsPanel.classList.remove("open"); scrim.classList.remove("open"); settingsPanel.setAttribute("aria-hidden","true"); }
@@ -926,6 +1037,15 @@ function attach(){
       .catch(e=>toast(e.message,"err"));
   });
   document.querySelectorAll(".settings .switch").forEach(sw=>sw.addEventListener("click",()=>sw.classList.toggle("on")));
+
+  // local models
+  $("embedApply").addEventListener("click",()=>applyLocalModel("embedding"));
+  $("rerankApply").addEventListener("click",()=>applyLocalModel("reranker"));
+  $("embedDownload").addEventListener("click",()=>downloadLocalModel("embedding"));
+  $("rerankDownload").addEventListener("click",()=>downloadLocalModel("reranker"));
+  embedSel.addEventListener("change",()=>{localSel.embedding=embedSel.value;});
+  rerankSel.addEventListener("change",()=>{localSel.reranker=rerankSel.value;});
+  $("chunkSize").addEventListener("input",()=>{if(localCatalog.length)renderLocalModels();});
 }
 
 /* ---------- boot ---------- */
@@ -933,6 +1053,7 @@ buildPipeline();
 renderAnswer();
 attach();
 refreshStatus();
+fetchLocalModels();
 refreshModels().then(()=>fetch("/api/settings").then(r=>r.json()).then(s=>{
   setSwitch("tgAdaptive",s.adaptive_rag);
   analysisModel=s.analysis_model||""; chatModel=s.chat_model||"";

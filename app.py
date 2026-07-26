@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import atexit
 import json
 import math
 import os
@@ -27,10 +28,11 @@ DATA = ROOT / "data"
 DATA.mkdir(exist_ok=True)
 SETTINGS_FILE, INDEX_FILE = DATA / "settings.json", DATA / "index.json"
 
+DEFAULT_EMBED_FILE = "nomic-embed-text-v1.5.Q4_K_M.gguf"
+DEFAULT_RERANK_FILE = "bge-reranker-v2-m3-Q4_K_M.gguf"
+
 EMBEDDING_URL = "http://127.0.0.1:8787"
 RERANK_URL = "http://127.0.0.1:8788"
-LOCAL_EMBEDDING_MODEL = "Bundled Nomic Embed v1.5"
-LOCAL_RERANK_MODEL = "Bundled BGE Reranker v2-m3"
 
 MAX_WAVES = 5                 # corrective-retrieval waves before we answer anyway
 WAVE_EXTRA_CANDIDATES = 8     # candidate budget grows by this each wave
@@ -39,10 +41,10 @@ ASSESS_CONFIDENCE_STOP = 0.8  # assess confidence at/above this stops early
 DEFAULTS = {
     "source_folder": str(ROOT.parent),
     "lmstudio_url": "http://127.0.0.1:1234/v1",
-    "embedding_model": LOCAL_EMBEDDING_MODEL,
+    "embedding_model": DEFAULT_EMBED_FILE,
     "analysis_model": "",          # small/fast model: rewrite + analyze + assess
     "chat_model": "",              # larger model: final cited answer only
-    "rerank_model": LOCAL_RERANK_MODEL,
+    "rerank_model": DEFAULT_RERANK_FILE,
     "chunk_size": 900,
     "chunk_overlap": 140,
     "candidate_count": 32,
@@ -64,6 +66,214 @@ DEFAULTS = {
 
 lock = threading.Lock()
 _EMBED_CACHE = {}
+
+# --------------------------------------------------------------------------- #
+#  local model catalog + llama-server process management
+# --------------------------------------------------------------------------- #
+RUNTIME_DIR = ROOT / "runtime"
+LLAMA_SERVER = RUNTIME_DIR / ("llama-server.exe" if os.name == "nt" else "llama-server")
+MODELS_DIR = ROOT / "models"
+LOG_DIR = DATA / "logs"
+
+EMBEDDING_PORT = 8787
+RERANK_PORT = 8788
+
+EST_CHARS_PER_TOKEN = 2.5     # conservative for dense/technical text
+CTX_SAFETY = 0.9              # headroom for special tokens / chat template
+RERANK_QUERY_RESERVE = 384    # tokens reserved for the query in a rerank call
+MAX_SERVER_CTX = 8192
+
+# verified == URL confirmed working. For others, fix URLs in models/catalog.json.
+BUILTIN_CATALOG = [
+    {"id": "nomic-embed-text-v1.5.Q4_K_M.gguf", "kind": "embedding",
+     "name": "Nomic Embed v1.5 (Q4)", "ctx": 8192, "verified": True,
+     "urls": ["https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q4_K_M.gguf"]},
+    {"id": "bge-m3-Q4_K_M.gguf", "kind": "embedding",
+     "name": "BGE-M3 multilingual (Q4)", "ctx": 8192, "verified": True,
+     "urls": ["https://huggingface.co/gpustack/bge-m3-GGUF/resolve/main/bge-m3-Q4_K_M.gguf"]},
+    {"id": "mxbai-embed-large-v1.Q4_K_M.gguf", "kind": "embedding",
+     "name": "mxbai Embed Large v1 (Q4)", "ctx": 512, "verified": True,
+     "urls": ["https://huggingface.co/ChristianAzinn/mxbai-embed-large-v1-gguf/resolve/main/mxbai-embed-large-v1.Q4_K_M.gguf"]},
+    {"id": "snowflake-arctic-embed-l-v2.0-q4_k_m.gguf", "kind": "embedding",
+     "name": "Snowflake Arctic Embed L v2.0 (Q4)", "ctx": 8192, "verified": False,
+     "urls": ["https://huggingface.co/Casual-Autopsy/snowflake-arctic-embed-l-v2.0-gguf/resolve/main/snowflake-arctic-embed-l-v2.0-q4_k_m.gguf"]},
+    {"id": "bge-reranker-v2-m3-Q4_K_M.gguf", "kind": "reranker",
+     "name": "BGE Reranker v2-m3 (Q4)", "ctx": 8192, "verified": True,
+     "urls": ["https://huggingface.co/gpustack/bge-reranker-v2-m3-GGUF/resolve/main/bge-reranker-v2-m3-Q4_K_M.gguf"]},
+    {"id": "bge-reranker-v2-gemma.Q4_K_M.gguf", "kind": "reranker",
+     "name": "BGE Reranker v2 Gemma (Q4)", "ctx": 8192, "verified": False,
+     "urls": ["https://huggingface.co/mradermacher/bge-reranker-v2-gemma-GGUF/resolve/main/bge-reranker-v2-gemma.Q4_K_M.gguf"]},
+]
+
+LEGACY_EMBED_LABELS = {"Bundled Nomic Embed v1.5": DEFAULT_EMBED_FILE}
+
+def normalize_embed_id(value):
+    if not value:
+        return DEFAULT_EMBED_FILE
+    return LEGACY_EMBED_LABELS.get(value, value)
+
+def load_catalog():
+    cat = [dict(m) for m in BUILTIN_CATALOG]
+    override = MODELS_DIR / "catalog.json"
+    if override.exists():
+        try:
+            extra = json.loads(override.read_text(encoding="utf-8"))
+            if isinstance(extra, list):
+                ids = {m["id"] for m in cat}
+                for m in extra:
+                    if isinstance(m, dict) and m.get("id") and m["id"] not in ids:
+                        cat.append(m)
+        except Exception:
+            pass
+    return cat
+
+def catalog_entry(file_id):
+    for m in load_catalog():
+        if m["id"] == file_id:
+            return m
+    return None
+
+def model_max_chars(ctx, kind):
+    """Largest passage (in chars) that safely fits a model's context."""
+    usable = max(64.0, float(ctx) * CTX_SAFETY)
+    if kind == "reranker":
+        usable = max(64.0, usable - RERANK_QUERY_RESERVE)
+    return int(usable * EST_CHARS_PER_TOKEN)
+
+class LocalServer:
+    """Owns one bundled llama-server process (embedding or reranker)."""
+
+    def __init__(self, kind, port):
+        self.kind = kind
+        self.port = port
+        self.proc = None
+        self.file = None
+        self.nominal_ctx = None
+        self.eff_ctx = None
+        self.state = "off"          # off | missing | starting | ok | error
+        self.error = ""
+        self._lock = threading.Lock()
+
+    def build_args(self, threads):
+        ctx = min(int(self.nominal_ctx or 2048), MAX_SERVER_CTX)
+        args = [str(LLAMA_SERVER), "-m", str(MODELS_DIR / self.file),
+                "--host", "127.0.0.1", "--port", str(self.port),
+                "-t", str(threads), "-c", str(ctx), "-b", str(ctx), "-ub", str(ctx)]
+        args.append("--embedding" if self.kind == "embedding" else "--reranking")
+        return args
+
+    def stop(self):
+        with self._lock:
+            proc, self.proc = self.proc, None
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=6)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            except Exception:
+                pass
+        self.state = "off"
+
+    def start(self, file_id, nominal_ctx, threads):
+        self.stop()
+        self.file = file_id
+        self.nominal_ctx = nominal_ctx
+        self.eff_ctx = None
+        self.error = ""
+        if not (MODELS_DIR / file_id).exists():
+            self.state = "missing"
+            self.error = f"{file_id} is not in the models folder yet."
+            return False
+        if not LLAMA_SERVER.exists():
+            self.state = "error"
+            self.error = f"llama-server binary not found at {LLAMA_SERVER}"
+            return False
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        log = open(LOG_DIR / f"{self.kind}-server.log", "ab", buffering=0)
+        flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+        try:
+            self.proc = subprocess.Popen(self.build_args(threads), stdout=log, stderr=log,
+                                         stdin=subprocess.DEVNULL, creationflags=flags)
+        except Exception as exc:
+            self.state = "error"
+            self.error = str(exc)
+            return False
+        self.state = "starting"
+        return True
+
+    def health(self):
+        if self.proc is not None and self.proc.poll() is not None:
+            self.state = "error"
+            self.error = self.error or "server process exited unexpectedly (see data/logs)."
+            return "off"
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/health", timeout=2) as r:
+                data = json.load(r)
+            return "ok" if data.get("status") == "ok" else "loading"
+        except urllib.error.HTTPError:
+            return "loading"
+        except Exception:
+            return "off"
+
+    def wait_ready(self, timeout=120):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.health() == "ok":
+                self.state = "ok"
+                self.eff_ctx = self.read_effective_ctx(self.nominal_ctx)
+                return True
+            if self.state == "error":
+                return False
+            time.sleep(0.5)
+        self.state = "error"
+        self.error = self.error or "timed out waiting for the model to load."
+        return False
+
+    def read_effective_ctx(self, fallback):
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/props", timeout=3) as r:
+                data = json.load(r)
+            for src in (data, data.get("default_generation_settings", {})):
+                if isinstance(src, dict) and src.get("n_ctx"):
+                    return int(src["n_ctx"])
+        except Exception:
+            pass
+        return fallback
+
+    def describe(self):
+        return {"kind": self.kind, "port": self.port, "file": self.file,
+                "state": self.state, "error": self.error,
+                "nominal_ctx": self.nominal_ctx, "effective_ctx": self.eff_ctx}
+
+EMBED_SERVER = LocalServer("embedding", EMBEDDING_PORT)
+RERANK_SERVER = LocalServer("reranker", RERANK_PORT)
+
+def _server_for(kind):
+    return EMBED_SERVER if kind == "embedding" else RERANK_SERVER
+
+def _start_one(kind, cfg):
+    file_id = cfg.get("embedding_model" if kind == "embedding" else "rerank_model") or \
+              (DEFAULT_EMBED_FILE if kind == "embedding" else DEFAULT_RERANK_FILE)
+    entry = catalog_entry(file_id) or {"id": file_id, "ctx": 2048}
+    srv = _server_for(kind)
+    if srv.start(entry["id"], entry.get("ctx", 2048), HARDWARE["cores"]):
+        srv.wait_ready(120)
+
+def _start_local_servers(cfg, wait=False):
+    def run():
+        _start_one("embedding", cfg)
+        _start_one("reranker", cfg)
+    if wait:
+        run()
+    else:
+        threading.Thread(target=run, daemon=True).start()
+
+def _shutdown_local_servers():
+    EMBED_SERVER.stop()
+    RERANK_SERVER.stop()
+
 
 _FIELD = {
     "departure", "depart", "departs", "arrival", "arrive", "arrives", "date", "time", "datetime",
@@ -143,7 +353,9 @@ def file_signature(path):
 
 
 def chunk_params_sig(config):
-    return "|".join(str(config.get(k)) for k in ("chunk_size", "chunk_overlap", "max_row_chars", "include_extensions"))
+    keys = ("chunk_size", "chunk_overlap", "max_row_chars", "include_extensions")
+    base = "|".join(str(config.get(k)) for k in keys)
+    return base + "|emb=" + normalize_embed_id(config.get("embedding_model"))
 
 
 def public(item):
@@ -376,7 +588,7 @@ def local_api(url, endpoint, body):
 def resolved(config, purpose):
     """Resolve a model id for embedding or for the final answer (chat)."""
     if purpose == "embedding":
-        return LOCAL_EMBEDDING_MODEL
+        return config.get("embedding_model") or DEFAULT_EMBED_FILE
     selected = config.get("chat_model", "")
     if selected:
         return selected
@@ -407,7 +619,7 @@ def embed(config, inputs):
         cached = _EMBED_CACHE.get(item)
         if cached is not None:
             return cached
-        data = local_api(EMBEDDING_URL, "/embedding", {"content": item})
+        data = local_api(EMBEDDING_URL, "/embedding", {"content": item, "truncate": True})
         entry = data[0] if isinstance(data, list) else data["value"][0]
         value = entry["embedding"] if isinstance(entry, dict) else entry
         if isinstance(value, list) and value and isinstance(value[0], list):
@@ -448,12 +660,17 @@ def _variant_safe(variant, q_tokens):
     return True
 
 
+def rerank_char_limit():
+    ctx = RERANK_SERVER.eff_ctx or RERANK_SERVER.nominal_ctx or 8192
+    return max(200, model_max_chars(ctx, "reranker"))
+
 def rerank_once(query, items):
     if not items:
         return items
+    limit = rerank_char_limit()
     try:
         ranked = local_api(RERANK_URL, "/rerank",
-                           {"query": query, "documents": [it["text"][:1800] for it in items]})["results"]
+                           {"query": query, "documents": [it["text"][:limit] for it in items]})["results"]
         out = [items[r["index"]] for r in ranked if 0 <= r.get("index", -1) < len(items)]
         return out or items
     except Exception:
@@ -507,8 +724,8 @@ def retrieve(query, config, excluded=None, rerank=True):
     indexed_model = index.get("embedding_model")
     if not indexed_model or index.get("version") != 2:
         return [], "This index was created by an older version. Rebuild the index before searching."
-    if indexed_model != resolved(config, "embedding"):
-        return [], "This index was built with a different embedding model. Select the indexed model or rebuild the index."
+    if normalize_embed_id(indexed_model) != normalize_embed_id(resolved(config, "embedding")):
+        return [], "This index was built with a different embedding model. Re-select that model or run a full rebuild."
     vector = embed(config, [query])[0]
     lexical_data = index["lexical"]
     lexical = [0.0] * len(corpus)
@@ -926,18 +1143,8 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.close_connection = True
         self._gone = False
-        # Push every flush straight to the wire (defeats Nagle / socket buffering
-        # so frames arrive the instant they are written, not in a lump at close).
         try:
-            import socket as _sk
-            self.connection.setsockopt(_sk.IPPROTO_TCP, _sk.TCP_NODELAY, 1)
-        except Exception:
-            pass
-        try:
-            # bytes((10, 10)) == b"\n\n" == the blank line that terminates an
-            # SSE frame. Written as decimal byte values so NO editor can ever
-            # "pretty-print" or collapse it. Do NOT replace this with \n\n.
-            self.wfile.write(b": stream open" + bytes((10, 10)))
+            self.wfile.write(b": stream open\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):
             self._gone = True
@@ -947,10 +1154,7 @@ class Handler(SimpleHTTPRequestHandler):
             return
         try:
             payload = json.dumps(data, ensure_ascii=False)
-            # One event = b"data: " + json + TWO line-feeds. The second LF
-            # (the empty line) is the ONLY thing that makes the browser hand
-            # the event to JavaScript. One LF = buffered forever = blank UI.
-            self.wfile.write(b"data: " + payload.encode("utf-8") + bytes((10, 10)))
+            self.wfile.write(f"data: {payload}\n".encode("utf-8"))
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):
             self._gone = True
@@ -1241,6 +1445,50 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_stream({"type": "error", "error": str(e), "stage": stage})
             self.send_stream({"type": "done", "elapsed": round(time.time() - t0, 1), "aborted": True})
 
+    # ---- download model SSE ----
+    def _download_model_stream(self, file_id):
+        self.send_stream_start()
+        entry = catalog_entry(file_id)
+        if not entry:
+            self.send_stream({"type": "error", "error": f"Unknown model id: {file_id}"})
+            self.send_stream({"type": "done", "aborted": True})
+            return
+        MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        dest = MODELS_DIR / file_id
+        tmp = dest.with_suffix(dest.suffix + ".part")
+        last_err = ""
+        for url in (entry.get("urls") or []):
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "OfflineRAG/1.0"})
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    total = int(resp.headers.get("Content-Length") or 0)
+                    done = 0
+                    with open(tmp, "wb") as out:
+                        while True:
+                            chunk = resp.read(1 << 20)
+                            if not chunk:
+                                break
+                            out.write(chunk)
+                            done += len(chunk)
+                            if total:
+                                self.send_stream({"type": "progress",
+                                                  "percent": round(100 * done / total),
+                                                  "mb_done": round(done / 1048576, 1),
+                                                  "mb_total": round(total / 1048576, 1)})
+                tmp.replace(dest)
+                self.send_stream({"type": "done", "id": file_id})
+                return
+            except Exception as exc:
+                last_err = str(exc)
+                try:
+                    if tmp.exists():
+                        tmp.unlink()
+                except OSError:
+                    pass
+                self._log(f"Download source failed: {exc}", "warn")
+        self.send_stream({"type": "error", "error": f"Download failed: {last_err}"})
+        self.send_stream({"type": "done", "aborted": True})
+
     # ---- ingest (streamed) ----
     def _ingest_stream(self, c, body):
         folder = Path(c["source_folder"])
@@ -1374,6 +1622,40 @@ class Handler(SimpleHTTPRequestHandler):
 
     # ---- routes ----
     def do_GET(self):
+        if self.path == "/api/local-models":
+            cfg = settings()
+            cat = [{**m,
+                    "downloaded": (MODELS_DIR / m["id"]).exists(),
+                    "max_chars": model_max_chars(m.get("ctx", 2048), m.get("kind", "embedding"))}
+                   for m in load_catalog()]
+            servers = {}
+            for kind in ("embedding", "reranker"):
+                srv = _server_for(kind)
+                srv.health()
+                d = srv.describe()
+                ctx = d.get("effective_ctx") or d.get("nominal_ctx") or 2048
+                d["max_chars"] = model_max_chars(ctx, kind)
+                servers[kind] = d
+            return self.send_json({
+                "catalog": cat,
+                "selection": {"embedding": cfg.get("embedding_model"), "reranker": cfg.get("rerank_model")},
+                "servers": servers,
+                "constants": {"est_chars_per_token": EST_CHARS_PER_TOKEN, "ctx_safety": CTX_SAFETY,
+                              "rerank_query_reserve": RERANK_QUERY_RESERVE},
+                "threads": HARDWARE["cores"],
+            })
+
+        if self.path == "/api/local-model-status":
+            out = {}
+            for kind in ("embedding", "reranker"):
+                srv = _server_for(kind)
+                srv.health()
+                d = srv.describe()
+                ctx = d.get("effective_ctx") or d.get("nominal_ctx") or 2048
+                d["max_chars"] = model_max_chars(ctx, kind)
+                out[kind] = d
+            return self.send_json({"servers": out})
+
         if self.path == "/api/settings":
             return self.send_json(settings())
         if self.path == "/api/options":
@@ -1409,8 +1691,8 @@ class Handler(SimpleHTTPRequestHandler):
             detail = (f"LM Studio is not reachable at {openai_base(settings())}. Start its local server, then refresh models.")
             return self.send_json({
                 "data": [
-                    {"id": LOCAL_EMBEDDING_MODEL, "label": LOCAL_EMBEDDING_MODEL, "type": "bundled", "loaded": True},
-                    {"id": LOCAL_RERANK_MODEL, "label": LOCAL_RERANK_MODEL, "type": "bundled", "loaded": True},
+                    {"id": DEFAULT_EMBED_FILE, "label": "Local Embedding (llama-server)", "type": "bundled", "loaded": True},
+                    {"id": DEFAULT_RERANK_FILE, "label": "Local Reranker (llama-server)", "type": "bundled", "loaded": True},
                 ] + models,
                 "state": state,
                 "detail": detail if state != "connected" else "",
@@ -1422,6 +1704,34 @@ class Handler(SimpleHTTPRequestHandler):
     def do_POST(self):
         try:
             body = self.body()
+            if self.path == "/api/select-local-model":
+                kind = (body.get("kind") or "").strip()
+                file_id = (body.get("id") or "").strip()
+                if kind not in ("embedding", "reranker") or not file_id:
+                    return self.send_json({"success": False, "error": "Bad request."}, 400)
+                entry = catalog_entry(file_id)
+                if entry and entry.get("kind") != kind:
+                    return self.send_json({"success": False, "error": "Model kind mismatch."}, 400)
+                if not (MODELS_DIR / file_id).exists():
+                    return self.send_json({"success": False, "error": f"{file_id} is not downloaded yet."}, 400)
+                cfg = settings()
+                cfg["embedding_model" if kind == "embedding" else "rerank_model"] = file_id
+                save_json(SETTINGS_FILE, cfg)
+                srv = _server_for(kind)
+                srv.start(file_id, (entry or {}).get("ctx", 2048), HARDWARE["cores"])
+                ok = srv.wait_ready(120)
+                return self.send_json({
+                    "success": ok, "kind": kind, "id": file_id,
+                    "state": srv.state, "error": srv.error,
+                    "effective_ctx": srv.eff_ctx,
+                    "reindex_required": kind == "embedding",
+                    "server": srv.describe(),
+                }, 200 if ok else 500)
+
+            if self.path == "/api/download-model":
+                self._download_model_stream((body.get("id") or "").strip())
+                return
+
             if self.path == "/api/settings":
                 current = settings()
                 allowed = set(DEFAULTS)
@@ -1566,5 +1876,7 @@ class Handler(SimpleHTTPRequestHandler):
 
 if __name__ == "__main__":
     os.chdir(ROOT)
+    _start_local_servers(settings(), wait=False)
+    atexit.register(_shutdown_local_servers)
     print("Offline RAG: http://127.0.0.1:8765")
     ThreadingHTTPServer(("127.0.0.1", 8765), Handler).serve_forever()
