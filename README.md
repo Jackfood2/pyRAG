@@ -1,6 +1,6 @@
 # Offline RAG workstation
 
-1. Run `Start-Offline-RAG.bat`. It starts the package-local embedding service, BGE cross-encoder reranker, and web app. LM Studio is not used for retrieval.
+1. Run `Install_Models.bat` then `Start-Offline-RAG.bat`. It starts the package-local embedding service, BGE cross-encoder reranker, and web app. LM Studio is not used for retrieval.
 2. Rebuild the index.
 3. Query locally. No document data is sent to the internet.
 
