@@ -1,28 +1,49 @@
+# README.md
+
+```markdown
 # Offline RAG — Local Document Intelligence
 
 > **100% Private, Portable, and Local Retrieval-Augmented Generation Workstation**  
-> Powered by an **Accumulate → Assess → Reformulate (CRAG-style)** pipeline, bundled GGUF embeddings, local reranking, and LM Studio integration.
+> Powered by an **Accumulate → Assess → Reformulate (CRAG-style)** pipeline, dual-LLM task delegation, bundled GGUF embeddings, local reranking, and LM Studio integration.
+
+---
+
+## 🆕 What's New & Key Updates
+
+### ⚡ Dual-Model Local Inference Engine
+Offline RAG now supports split-model execution in LM Studio to maximize both processing speed and answer quality:
+- **Evidence Analysis Model (0.5B – 3B):** A small, ultra-fast local LLM handles low-latency tasks: query rewriting, passage summarization, tag classification (`[ANSWERS]`, `[PARTIAL]`, `[RELATED]`, `[OFFTOPIC]`), and assessment checkpoint checks.
+- **Final Answer Model (7B+):** A larger, higher-capacity LLM reads the collated factual notes and generates the final, cited response.
+
+### 🧩 Multi-Source Fact Synthesis
+- **Complementary Passage Merging:** The prompt engine now instructs the answer LLM to combine distinct details from multiple matching passages (e.g., pulling names from Source A, fare details from Source B, and confirmation numbers from Source C).
+- **Auto-Retry Validation:** If the pipeline detects that the answer model anchored onto a single source despite multiple contributing passages being available, it automatically triggers a synthesis retry.
+
+### 🔌 Verified LM Studio Loader & Telemetry
+- **One-Click Hot-Loading:** Select and load models directly from the settings panel with real-time status toasts and verification checks.
+- **Model Telemetry Logging:** Every run logs the active analysis and answer models directly into the pipeline console.
+- **UI Enhancements:** Added an evidence overview banner and raw model output toggles on evidence cards.
 
 ---
 
 ## 📸 Overview
 
-**Offline RAG** is a self-contained, fully offline document intelligence platform designed to ingest, index, analyze, and query your local documents without sending data to external APIs or cloud services.
+**Offline RAG** is a complete, self-contained document intelligence workstation designed to index, search, and analyze your local files without sending any data over the internet or relying on external cloud APIs.
 
-It features a modern web workstation interface with real-time pipeline telemetry, interactive evidence cards with model output inspection, inline citation spotlighting, and streaming answers.
+It features a modern web interface with live pipeline telemetry, interactive evidence cards, model raw output inspection, citation spotlighting, and streaming answers.
 
 ---
 
-## ✨ Key Features
+## ✨ Core Features
 
-- 🔒 **100% Offline & Private:** Embeddings, reranking, and document processing run completely local on your CPU/GPU.
-- 🔄 **Corrective / Adaptive RAG Pipeline:** Uses query expansion, HyDE (Hypothetical Document Embeddings), and iterative retrieval waves.
-- 🎯 **Hybrid Retrieval Engine:** Combines dense semantic vector embeddings (`Nomic Embed v1.5`) with exact keyword search (`BM25`) using Reciprocal Rank Fusion (RRF).
-- ⚡ **Bundled Reranking:** Re-scores retrieved passages using `BGE Reranker v2-m3` for ultra-precise relevance ranking.
-- 🔍 **No-Drop Analysis Loop:** Every retrieved passage is analyzed, summarized, and tagged (`[ANSWERS]`, `[PARTIAL]`, `[RELATED]`, `[OFFTOPIC]`) by the local model—ensuring zero lost evidence.
-- 🏷️ **Inline Citations & Evidence Spotlight:** Streamed answers feature clickable `[1]`, `[2]` citation tags that highlight the exact supporting source passage in real time.
-- 📁 **Multi-Format Document Support:** Processes `.pdf`, `.docx`, `.xlsx`, `.xlsm`, `.csv`, `.md`, and `.txt` files.
-- 🎛️ **Zero External Dependencies:** Portable Python environment bundled with local `llama-server.exe` binaries for background embedding and reranker inferencing.
+- 🔒 **100% Offline & Private:** Vector embeddings, reranking, and text analysis run locally on your hardware.
+- 🔄 **Corrective / Adaptive Pipeline:** Uses query planning, HyDE (Hypothetical Document Embeddings), and iterative retrieval waves.
+- 🎯 **Hybrid Search Engine:** Combines dense semantic vector similarity (`Nomic Embed v1.5`) with lexical keyword search (`BM25`) using Reciprocal Rank Fusion (RRF).
+- ⚡ **Bundled Local Reranker:** Re-scores retrieved candidates using `BGE Reranker v2-m3`.
+- 🔍 **No-Drop Analysis Loop:** Every retrieved passage is analyzed, summarized, and categorized—ensuring zero lost context.
+- 🏷️ **Inline Citations & Evidence Spotlight:** Clickable `[1]`, `[2]` citation tags highlight supporting source cards in real time.
+- 📁 **Multi-Format Ingestion:** Supports `.pdf`, `.docx`, `.xlsx`, `.xlsm`, `.csv`, `.md`, and `.txt` files.
+- 📦 **Zero Python Installation Required:** Bundled portable Python runtime and `llama-server.exe` binaries.
 
 ---
 
@@ -30,73 +51,73 @@ It features a modern web workstation interface with real-time pipeline telemetry
 
 ```text
 OfflineRAG/
-├── data/                    # Local index storage & settings JSON
-├── models/                  # GGUF models directory (populated via script)
+├── data/                    # Local vector index storage & user settings JSON
+├── models/                  # GGUF model binaries directory
 │   ├── nomic-embed-text-v1.5.Q4_K_M.gguf
 │   └── bge-reranker-v2-m3-Q4_K_M.gguf
 ├── python/                  # Portable Python runtime environment
 ├── runtime/                 # Portable llama-server binaries
-├── vendor/                  # Bundled Python helper dependencies
-├── app.py                   # RAG HTTP server & pipeline execution engine
-├── index.html               # Web UI interface
-├── Install_Models.bat       # Model downloader batch script
-└── Start-Offline-RAG.bat    # Application launcher batch script
+├── vendor/                  # Python helper dependencies
+├── app.py                   # RAG backend server & execution engine
+├── index.html               # Web UI workstation interface
+├── Install_Models.bat       # Automatic model installer script
+└── Start-Offline-RAG.bat    # Workstation launcher script
 ```
 
 ---
 
-## ⚙️ Prerequisites & Requirements
+## ⚙️ System Requirements
 
-- **OS:** Windows 10 or 11 (64-bit)
-- **CPU:** Multi-core x86_64 processor (4+ CPU cores recommended)
-- **RAM:** 8 GB minimum (16 GB+ recommended for large document collections)
-- **LM Studio (Optional):** Required only if you want generated LLM text answers. The RAG retrieval, embedding, reranking, and evidence extraction work 100% locally even without LM Studio (Evidence-Only Mode).
+- **Operating System:** Windows 10 or Windows 11 (64-bit)
+- **Processor:** 4+ CPU cores (x86_64)
+- **RAM:** 8 GB minimum (16 GB+ recommended)
+- **LM Studio (Optional):** Required only for LLM answer generation and passage summarization. RAG retrieval, embeddings, and reranking operate 100% locally even without LM Studio (Evidence-Only Mode).
 
 ---
 
-## 🚀 Quick Start Guide
+## 🚀 Installation & Quick Start
 
-### Step 1: Download the RAG Models
+### Step 1: Download RAG Models (`Install_Models.bat`)
 Double-click **`Install_Models.bat`**.
 
-This script automatically downloads the necessary GGUF embedding and reranker models into the `models/` directory using `curl`:
-1. `nomic-embed-text-v1.5.Q4_K_M.gguf` (Embeddings)
-2. `bge-reranker-v2-m3-Q4_K_M.gguf` (Reranker)
+This batch script automatically creates the `models/` directory and downloads the required GGUF files using `curl`:
+1. **Embedding Model:** `nomic-embed-text-v1.5.Q4_K_M.gguf`
+2. **Reranker Model:** `bge-reranker-v2-m3-Q4_K_M.gguf`
 
-> **Note:** If a download fails due to network constraints, the script will automatically fallback to verified secondary mirrors.
-
----
-
-### Step 2: (Optional) Launch LM Studio for Text Generation
-If you want generated answers (in addition to retrieved evidence):
-1. Open **LM Studio**.
-2. Load any chat model of your choice (e.g., *Llama 3*, *Qwen 2.5*, *Mistral*, *Phi-3*).
-3. Start the Local Inference Server on port **`127.0.0.1:1234`** (Default OpenAI-compatible endpoint).
-
-*If LM Studio is not running, Offline RAG will automatically default to **Evidence-Only Mode**.*
+> **Note:** The installer includes automatic fallback mirrors in case primary downloads are blocked or slow.
 
 ---
 
-### Step 3: Launch Offline RAG
+### Step 2: Set Up LM Studio (Optional)
+To enable generated answers and automated passage analysis:
+1. Launch **LM Studio**.
+2. Load your desired model(s). For optimal performance, load:
+   - A fast model (e.g., `Qwen2.5-0.5B` or `Llama-3.2-1B`) for **Evidence Analysis**.
+   - A larger model (e.g., `Llama-3.8B`, `Qwen2.5-7B`, or `Mistral-7B`) for **Final Answer Generation**.
+3. Start the Local Server on port **`127.0.0.1:1234`** (Default API endpoint).
+
+---
+
+### Step 3: Launch Offline RAG (`Start-Offline-RAG.bat`)
 Double-click **`Start-Offline-RAG.bat`**.
 
-The launcher will automatically start three local processes in the background:
-| Service | Endpoint | Role |
+The launcher automatically spins up three background processes:
+| Process | Port / Endpoint | Description |
 | :--- | :--- | :--- |
-| **Embedding Server** | `http://127.0.0.1:8787` | Background `llama-server.exe` running Nomic Embed |
-| **Reranker Server** | `http://127.0.0.1:8788` | Background `llama-server.exe` running BGE Reranker |
-| **RAG Application** | `http://127.0.0.1:8765` | Python web application server |
+| **Embedding Server** | `http://127.0.0.1:8787` | Local `llama-server.exe` running Nomic Embed |
+| **Reranker Server** | `http://127.0.0.1:8788` | Local `llama-server.exe` running BGE Reranker |
+| **RAG Application** | `http://127.0.0.1:8765` | Portable Python server running `app.py` |
 
-Once initialized, your web browser will automatically open:
+Your default web browser will automatically open:
 ```text
 http://127.0.0.1:8765
 ```
 
 ---
 
-## 🛠️ How It Works (Pipeline Architecture)
+## 🛠️ Pipeline Architecture
 
-Offline RAG employs an advanced 5-stage **Accumulate → Assess → Reformulate** architecture:
+Offline RAG processes queries through a 5-stage pipeline:
 
 ```
 [01 UNDERSTAND] ──► [02 RETRIEVE] ──► [03 ANALYZE] ──► [04 ASSESS] ──► [05 ANSWER]
@@ -104,73 +125,54 @@ Offline RAG employs an advanced 5-stage **Accumulate → Assess → Reformulate*
  HyDE Expansion       + BM25 + Rerank      & Summarization     & Gap Search Wave    Answer Output
 ```
 
-1. **01 UNDERSTAND (Query Optimization):**
-   - Cleans and rewrites user prompts into targeted retrieval terms.
-   - Generates HyDE (Hypothetical Document Embeddings) variations to capture conceptual matches.
-
-2. **02 RETRIEVE (Fused Hybrid Search):**
-   - Performs concurrent dense vector similarity search (`Nomic Embed`) and BM25 keyword matching.
-   - Merges results using Reciprocal Rank Fusion (RRF) and re-scores candidates via `BGE Reranker v2-m3`.
-
-3. **03 ANALYZE (No-Drop Passage Assessment):**
-   - The model analyzes each passage and assigns a relevance tag (`[ANSWERS]`, `[PARTIAL]`, `[RELATED]`, `[OFFTOPIC]`).
-   - Every passage is retained in memory—no raw text is discarded.
-
-4. **04 ASSESS (Corrective Gap Loop):**
-   - Evaluates accumulated notes against the question at designated checkpoints.
-   - If evidence is incomplete, extracts the remaining query gap and executes a new corrective retrieval wave.
-
-5. **05 ANSWER (Cited Generation):**
-   - Generates a grounded, cited response using numbered inline references `[1]`, `[2]`.
-   - Utilizes contrast notes (`[RELATED]` / `[OFFTOPIC]`) to explain document gaps if exact facts are missing, avoiding bare refusals.
+1. **01 UNDERSTAND:** Query optimizer generates alternative search queries and hypothetical answers (HyDE).
+2. **02 RETRIEVE:** Performs dense similarity search and lexical BM25 matching, combined via Reciprocal Rank Fusion (RRF) and re-scored with `BGE Reranker v2-m3`.
+3. **03 ANALYZE:** Every passage is summarized and tagged (`[ANSWERS]`, `[PARTIAL]`, `[RELATED]`, `[OFFTOPIC]`) by the local analysis model. No passages are discarded.
+4. **04 ASSESS:** Evaluates accumulated notes against the query. If details are missing, extracts the factual gap and launches a new search wave.
+5. **05 ANSWER:** Synthesizes notes into a final response with clickable `[1]` citations. Combines information across multiple sources and uses contrast notes to explain document gaps.
 
 ---
 
-## 🎛️ Configuration Options
+## 🎛️ Settings & Customization
 
-Click the gear icon (**⚙**) in the top-right corner of the interface to adjust settings:
+Click the **⚙ Settings** icon in the top-right corner to configure:
 
 - **LM Studio Integration:**
-  - Base URL (Default: `http://127.0.0.1:1234/v1`)
-  - Model selection & hot-loading controls.
-- **Indexing Options:**
-  - Custom document folder path selection.
-  - Supported file extension filters.
-  - Passage size (chars) & passage overlap settings.
-  - **Add / Update (Incremental):** Ingests new or modified documents while preserving existing cached vectors.
-  - **Rebuild from Scratch:** Performs a complete clean re-indexing.
+  - Base API URL (`http://127.0.0.1:1234/v1`).
+  - **Evidence Analysis Model:** Dedicated drop-down & load button for small/fast LLMs.
+  - **Final Answer Model:** Dedicated drop-down & load button for answer generation LLMs.
+- **Document Indexing:**
+  - Source folder selector & extension whitelist (`.pdf,.docx,.xlsx,.txt,.md,.csv`).
+  - Chunk size & overlap parameters.
+  - **Add / Update:** Incremental index update reusing existing embeddings.
+  - **Rebuild from Scratch:** Clean index rebuild.
 - **Retrieval Balance:**
-  - Weighting slider for **Semantic Vectors** vs. **Exact Keywords**.
-- **Assessment Parameters:**
-  - Search candidate count, assess checkpoint intervals, and maximum hard limits.
+  - Slider to balance Semantic Vector weighting vs. Exact Keyword (BM25) search.
+- **Loop Parameters:**
+  - Search candidate count, assess checkpoint frequency, and candidate check limits.
 
 ---
 
 ## ❓ Frequently Asked Questions (FAQ)
 
 <details>
-<summary><b>Q: Do I need an internet connection to run this?</b></summary>
-<b>A:</b> No. Once you run <code>Install_Models.bat</code> to download the GGUF models, the entire platform runs 100% offline without sending any data over the internet.
+<summary><b>Q: Do I need internet access after setup?</b></summary>
+<b>A:</b> No. Once <code>Install_Models.bat</code> finishes downloading the model files, Offline RAG runs completely disconnected from the internet.
 </details>
 
 <details>
-<summary><b>Q: What document types can I ingest?</b></summary>
-<b>A:</b> Offline RAG supports <code>.txt</code>, <code>.md</code>, <code>.csv</code>, <code>.pdf</code>, <code>.docx</code>, <code>.xlsx</code>, and <code>.xlsm</code> files.
+<summary><b>Q: Can I run this without LM Studio?</b></summary>
+<b>A:</b> Yes. Without LM Studio, Offline RAG runs in <b>Evidence Only</b> mode, retrieving, reranking, and displaying annotated document passages without generating a synthesized answer.
 </details>
 
 <details>
-<summary><b>Q: Can I use Offline RAG without LM Studio?</b></summary>
-<b>A:</b> Yes! If LM Studio is not connected, the application will operate in <b>Evidence Only</b> mode. It will retrieve, rank, analyze, and cite relevant passages directly from your documents.
-</details>
-
-<details>
-<summary><b>Q: How do I change my document directory?</b></summary>
-<b>A:</b> Open Settings (⚙ icon in top right), select or paste your desired directory under <b>Source folder</b>, and click <b>Add / update</b> or <b>Rebuild from scratch</b>.
+<summary><b>Q: How do I change the target folder for document ingestion?</b></summary>
+<b>A:</b> Open Settings (⚙), pick or enter a directory path under <b>Source folder</b>, and click <b>Add / update</b> or <b>Rebuild from scratch</b>.
 </details>
 
 ---
 
 ## 📄 License
 
-Distributed under the MIT License. See `LICENSE` for more information.
+Distributed under the MIT License. See `LICENSE` for details.
 ```
