@@ -1,0 +1,114 @@
+[
+  {
+    "id": "snowflake-arctic-embed-l-v2.0-q4_k_m.gguf",
+    "kind": "embedding",
+    "name": "Snowflake Arctic Embed L v2.0 (Q4)",
+    "ctx": 8192,
+    "verified": false,
+    "urls": ["https://huggingface.co/Casual-Autopsy/snowflake-arctic-embed-l-v2.0-gguf/resolve/main/snowflake-arctic-embed-l-v2.0-q4_k_m.gguf"]
+  },
+  {
+    "id": "mxbai-embed-large-v1.Q4_K_M.gguf",
+    "kind": "embedding",
+    "name": "mxbai Embed Large v1 (Q4)",
+    "ctx": 512,
+    "verified": true,
+    "urls": ["https://huggingface.co/ChristianAzinn/mxbai-embed-large-v1-gguf/resolve/main/mxbai-embed-large-v1.Q4_K_M.gguf"]
+  },
+  {
+    "id": "mxbai-embed-large-v1.Q8_0.gguf",
+    "kind": "embedding",
+    "name": "mxbai Embed Large v1 (Q8)",
+    "ctx": 512,
+    "verified": true,
+    "urls": ["https://huggingface.co/ChristianAzinn/mxbai-embed-large-v1-gguf/resolve/main/mxbai-embed-large-v1.Q8_0.gguf"]
+  },
+  {
+    "id": "nomic-embed-text-v1.5.Q4_K_M.gguf",
+    "kind": "embedding",
+    "name": "Nomic Embed v1.5 (Q4)",
+    "ctx": 8192,
+    "verified": true,
+    "urls": ["https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q4_K_M.gguf"]
+  },
+  {
+    "id": "nomic-embed-text-v1.5.Q8_0.gguf",
+    "kind": "embedding",
+    "name": "Nomic Embed v1.5 (Q8)",
+    "ctx": 8192,
+    "verified": true,
+    "urls": ["https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q8_0.gguf"]
+  },
+  {
+    "id": "bge-m3-Q4_K_M.gguf",
+    "kind": "embedding",
+    "name": "BGE-M3 multilingual (Q4)",
+    "ctx": 8192,
+    "verified": true,
+    "urls": ["https://huggingface.co/gpustack/bge-m3-GGUF/resolve/main/bge-m3-Q4_K_M.gguf"]
+  },
+  {
+    "id": "bge-m3-Q8_0.gguf",
+    "kind": "embedding",
+    "name": "BGE-M3 multilingual (Q8)",
+    "ctx": 8192,
+    "verified": true,
+    "urls": ["https://huggingface.co/gpustack/bge-m3-GGUF/resolve/main/bge-m3-Q8_0.gguf"]
+  },
+  {
+    "id": "bge-reranker-v2-m3-Q4_K_M.gguf",
+    "kind": "reranker",
+    "name": "BGE Reranker v2-m3 (Q4)",
+    "ctx": 8192,
+    "verified": true,
+    "urls": ["https://huggingface.co/gpustack/bge-reranker-v2-m3-GGUF/resolve/main/bge-reranker-v2-m3-Q4_K_M.gguf"]
+  },
+  {
+    "id": "bge-reranker-v2-m3-Q8_0.gguf",
+    "kind": "reranker",
+    "name": "BGE Reranker v2-m3 (Q8)",
+    "ctx": 8192,
+    "verified": true,
+    "urls": ["https://huggingface.co/gpustack/bge-reranker-v2-m3-GGUF/resolve/main/bge-reranker-v2-m3-Q8_0.gguf"]
+  },
+  {
+    "id": "bge-reranker-v2-gemma.Q4_K_M.gguf",
+    "kind": "reranker",
+    "name": "BGE Reranker v2 Gemma (Q4)",
+    "ctx": 8192,
+    "verified": false,
+    "urls": ["https://huggingface.co/mradermacher/bge-reranker-v2-gemma-GGUF/resolve/main/bge-reranker-v2-gemma.Q4_K_M.gguf"]
+  },
+  {
+    "id": "bge-reranker-v2-gemma.Q8_0.gguf",
+    "kind": "reranker",
+    "name": "BGE Reranker v2 Gemma (Q8)",
+    "ctx": 8192,
+    "verified": false,
+    "urls": ["https://huggingface.co/mradermacher/bge-reranker-v2-gemma-GGUF/resolve/main/bge-reranker-v2-gemma.Q8_0.gguf"]
+  },
+  {
+    "id": "Qwen3-Embedding-4B-Q4_K_M.gguf",
+    "kind": "embedding",
+    "name": "Qwen3 Embed (4B)",
+    "ctx": 32768,
+    "verified": false,
+    "urls": ["https://huggingface.co/Qwen/Qwen3-Embedding-4B-GGUF/resolve/main/Qwen3-Embedding-4B-Q4_K_M.gguf"]
+  },
+  {
+    "id": "Qwen3-Embedding-8B-Q4_K_M.gguf",
+    "kind": "embedding",
+    "name": "Qwen3 Embed (8B)",
+    "ctx": 32768,
+    "verified": false,
+    "urls": ["https://huggingface.co/Qwen/Qwen3-Embedding-8B-GGUF/resolve/main/Qwen3-Embedding-8B-Q4_K_M.gguf"]
+  },
+  {
+    "id": "KaLM-Embedding-Gemma3-12B-2511-Q4_K_M.gguf",
+    "kind": "embedding",
+    "name": "KaLM Gemma3 (12B)",
+    "ctx": 32768,
+    "verified": false,
+    "urls": ["https://huggingface.co/frob/KaLM-Embedding-Gemma3-12B-2511-GGUF/resolve/main/KaLM-Embedding-Gemma3-12B-2511-Q4_K_M.gguf"]
+  }
+]
