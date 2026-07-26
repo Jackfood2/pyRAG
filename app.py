@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 
+import array
 import atexit
 import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -20,6 +22,19 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+# Try to load LanceDB if the user ran Install_LanceDB.bat
+try:
+    import lancedb
+    LANCEDB_AVAILABLE = True
+except ImportError:
+    LANCEDB_AVAILABLE = False
+
+try:
+    import numpy as np
+    NUMPY_AVAILABLE = True
+except ImportError:
+    NUMPY_AVAILABLE = False
+
 ROOT = Path(__file__).resolve().parent
 VENDOR = ROOT / "vendor"
 if VENDOR.exists():
@@ -34,22 +49,22 @@ DEFAULT_RERANK_FILE = "bge-reranker-v2-m3-Q4_K_M.gguf"
 EMBEDDING_URL = "http://127.0.0.1:8787"
 RERANK_URL = "http://127.0.0.1:8788"
 
-MAX_WAVES = 5                 # corrective-retrieval waves before we answer anyway
-WAVE_EXTRA_CANDIDATES = 8     # candidate budget grows by this each wave
-ASSESS_CONFIDENCE_STOP = 0.8  # assess confidence at/above this stops early
+MAX_WAVES = 5                 
+WAVE_EXTRA_CANDIDATES = 8     
+ASSESS_CONFIDENCE_STOP = 0.8  
 
 DEFAULTS = {
     "source_folder": str(ROOT.parent),
     "lmstudio_url": "http://127.0.0.1:1234/v1",
     "embedding_model": DEFAULT_EMBED_FILE,
-    "analysis_model": "",          # small/fast model: rewrite + analyze + assess
-    "chat_model": "",              # larger model: final cited answer only
+    "analysis_model": "",          
+    "chat_model": "",              
     "rerank_model": DEFAULT_RERANK_FILE,
     "chunk_size": 900,
     "chunk_overlap": 140,
     "candidate_count": 32,
-    "rerank_count": 4,                 # repurposed: assess-checkpoint interval
-    "max_candidate_checks": 24,        # hard cap on passages analysed
+    "rerank_count": 4,                 
+    "max_candidate_checks": 24,        
     "semantic_weight": 0.72,
     "keyword_weight": 0.28,
     "use_llm_rerank": True,
@@ -59,13 +74,47 @@ DEFAULTS = {
     "max_row_chars": 5000,
     "adaptive_rag": True,
     "use_hyde": True,
-    "fast_path_score": 0.82,           # legacy, unused by v5
+    "use_lancedb": True,               # <--- New setting added for LanceDB
+    "fast_path_score": 0.82,           
     "memory_fact_limit": 18,
     "context_window": 8192,
 }
 
 lock = threading.Lock()
 _EMBED_CACHE = {}
+
+# --------------------------------------------------------------------------- #
+#  RAM IN-MEMORY INDEX CACHE (Lightning fast retrieval)
+# --------------------------------------------------------------------------- #
+_INDEX_CACHE = None
+_CACHE_MTIME = 0
+
+def get_cached_index():
+    global _INDEX_CACHE, _CACHE_MTIME
+    if not INDEX_FILE.exists():
+        return {"chunks": [], "lexical": {"lengths": [], "average_length": 1, "document_frequency": {}, "postings": {}}}
+    
+    mtime = INDEX_FILE.stat().st_mtime_ns
+    if _INDEX_CACHE is not None and _CACHE_MTIME == mtime:
+        return _INDEX_CACHE
+
+    # Load 100MB+ JSON from disk ONLY ONCE into RAM
+    data = load(INDEX_FILE, {"chunks": []})
+    
+    # Pre-allocate binary array buffers for ultra-fast cosine similarity loop
+    for chunk in data.get("chunks", []):
+        if "embedding" in chunk and isinstance(chunk["embedding"], list):
+            chunk["_vec_buf"] = array.array('f', chunk["embedding"])
+
+    _INDEX_CACHE = data
+    _CACHE_MTIME = mtime
+    return _INDEX_CACHE
+
+
+def invalidate_index_cache():
+    global _INDEX_CACHE, _CACHE_MTIME
+    _INDEX_CACHE = None
+    _CACHE_MTIME = 0
 
 # --------------------------------------------------------------------------- #
 #  local model catalog + llama-server process management
@@ -78,12 +127,11 @@ LOG_DIR = DATA / "logs"
 EMBEDDING_PORT = 8787
 RERANK_PORT = 8788
 
-EST_CHARS_PER_TOKEN = 2.5     # conservative for dense/technical text
-CTX_SAFETY = 0.9              # headroom for special tokens / chat template
-RERANK_QUERY_RESERVE = 384    # tokens reserved for the query in a rerank call
+EST_CHARS_PER_TOKEN = 2.5     
+CTX_SAFETY = 0.9              
+RERANK_QUERY_RESERVE = 384    
 MAX_SERVER_CTX = 8192
 
-# verified == URL confirmed working. For others, fix URLs in models/catalog.json.
 BUILTIN_CATALOG = [
     {"id": "nomic-embed-text-v1.5.Q4_K_M.gguf", "kind": "embedding",
      "name": "Nomic Embed v1.5 (Q4)", "ctx": 8192, "verified": True,
@@ -134,15 +182,12 @@ def catalog_entry(file_id):
     return None
 
 def model_max_chars(ctx, kind):
-    """Largest passage (in chars) that safely fits a model's context."""
     usable = max(64.0, float(ctx) * CTX_SAFETY)
     if kind == "reranker":
         usable = max(64.0, usable - RERANK_QUERY_RESERVE)
     return int(usable * EST_CHARS_PER_TOKEN)
 
 class LocalServer:
-    """Owns one bundled llama-server process (embedding or reranker)."""
-
     def __init__(self, kind, port):
         self.kind = kind
         self.port = port
@@ -150,7 +195,7 @@ class LocalServer:
         self.file = None
         self.nominal_ctx = None
         self.eff_ctx = None
-        self.state = "off"          # off | missing | starting | ok | error
+        self.state = "off"
         self.error = ""
         self._lock = threading.Lock()
 
@@ -717,16 +762,21 @@ def _loaded_set(models):
 #  retrieval
 # --------------------------------------------------------------------------- #
 def retrieve(query, config, excluded=None, rerank=True):
-    index = load(INDEX_FILE, {"chunks": []})
-    corpus = index["chunks"]
+    # DYNAMIC RAM CACHING: loads instantly using array buffer
+    index = get_cached_index()
+    corpus = index.get("chunks", [])
     if not corpus:
         return [], "Index is empty. Ingest documents first."
+    
     indexed_model = index.get("embedding_model")
     if not indexed_model or index.get("version") != 2:
         return [], "This index was created by an older version. Rebuild the index before searching."
     if normalize_embed_id(indexed_model) != normalize_embed_id(resolved(config, "embedding")):
         return [], "This index was built with a different embedding model. Re-select that model or run a full rebuild."
+    
     vector = embed(config, [query])[0]
+    
+    # Keyword / Lexical Scoring
     lexical_data = index["lexical"]
     lexical = [0.0] * len(corpus)
     for term in set(words(query)):
@@ -738,20 +788,68 @@ def retrieve(query, config, excluded=None, rerank=True):
             lexical[item_index] += (
                 idf * count * 2.2 / (count + 1.2 * (0.25 + 0.75 * length / max(lexical_data["average_length"], 1)))
             )
-    semantic_rank = sorted(range(len(corpus)), key=lambda i: cosine(vector, corpus[i].get("embedding", [])), reverse=True)
-    lexical_rank = sorted(range(len(corpus)), key=lambda i: lexical[i], reverse=True)
+            
+    candidates_needed = positive(config.get("candidate_count"), 32, 4, 400)
+    top_k = candidates_needed * 5
+    
+    semantic_rank = []
+    semantic_scores = {}
+    used_lancedb = False
+    
+    # 1. LanceDB Vector Search (Sub-millisecond)
+    if config.get("use_lancedb") and LANCEDB_AVAILABLE and (DATA / "lancedb").exists():
+        try:
+            import numpy as np
+            db = lancedb.connect(str(DATA / "lancedb"))
+            table = db.open_table("chunks")
+            query_vec = np.array(vector, dtype=np.float32)
+            results = table.search(query_vec).metric("cosine").limit(top_k).to_list()
+            id_to_idx = {c["id"]: i for i, c in enumerate(corpus)}
+            for r in results:
+                idx = id_to_idx.get(r.get("id"))
+                if idx is not None:
+                    semantic_rank.append(idx)
+                    # cosine distance ∈ [0, 2]; similarity = 1 − distance
+                    semantic_scores[idx] = 1.0 - r.get("_distance", 1.0)
+            used_lancedb = True
+        except Exception:
+            pass   # fall through to brute-force array search below
+
+    # 2. Fallback Array Buffer Search (Pure python, super fast)
+    if not used_lancedb:
+        def _fast_cosine(vec_a, chunk):
+            vec_b = chunk.get("_vec_buf")
+            if vec_b is not None and len(vec_a) == len(vec_b):
+                return sum(x * y for x, y in zip(vec_a, vec_b))
+            return cosine(vec_a, chunk.get("embedding", []))
+            
+        scores = [(_fast_cosine(vector, c), i) for i, c in enumerate(corpus)]
+        scores.sort(reverse=True, key=lambda x: x[0])
+        semantic_rank = [i for _, i in scores[:top_k]]
+        for s, i in scores[:top_k]:
+            semantic_scores[i] = s
+
+    lexical_rank = sorted(range(len(corpus)), key=lambda i: lexical[i], reverse=True)[:top_k]
+    
     fused = Counter()
     for rank, idx in enumerate(semantic_rank, 1):
         fused[idx] += float(config.get("semantic_weight", 0.72)) / (60 + rank)
     for rank, idx in enumerate(lexical_rank, 1):
         fused[idx] += float(config.get("keyword_weight", 0.28)) / (60 + rank)
-    candidates = positive(config.get("candidate_count"), 32, 4, 400)
+        
     excluded = excluded or set()
-    result = [
-        dict(corpus[idx], _score=fused[idx], _semantic_score=cosine(vector, corpus[idx].get("embedding", [])))
-        for idx in sorted(fused, key=fused.get, reverse=True)
-        if corpus[idx].get("id") not in excluded
-    ][:candidates]
+    result = []
+    for idx in sorted(fused, key=fused.get, reverse=True):
+        chunk = corpus[idx]
+        if chunk.get("id") in excluded:
+            continue
+        item = dict(chunk)
+        item["_score"] = fused[idx]
+        item["_semantic_score"] = semantic_scores.get(idx, 0)
+        result.append(item)
+        if len(result) >= candidates_needed:
+            break
+            
     if rerank and config["use_llm_rerank"] and result:
         result = rerank_once(query, result)
     return result, None
@@ -1199,7 +1297,7 @@ class Handler(SimpleHTTPRequestHandler):
         stage = "understand"
 
         answer_model = (c.get("chat_model") or "").strip()
-        a_model = analysis_model_for(c)        # analysis model (falls back to answer model)
+        a_model = analysis_model_for(c)        
         have_analysis = bool(a_model)
 
         self.send_stream({"type": "run_start", "evidence_only": evidence_only,
@@ -1327,7 +1425,6 @@ class Handler(SimpleHTTPRequestHandler):
                         "accepted_count": len(analyzed),
                         "target": checkpoint,
                     })
-                    # ---- 04 assess at each checkpoint (analysis model) ----
                     if have_analysis and len(analyzed) % checkpoint == 0 and checks_done < max_checks:
                         self._log(f"Assess checkpoint ({len(analyzed)} notes) — can we answer yet?")
                         sufficient, gap = self.pulse_while(lambda: assess_sufficiency(c, query, analyzed, model=a_model))
@@ -1351,7 +1448,6 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_stream({"type": "done", "elapsed": round(time.time() - t0, 1)})
                 return
 
-            # final assess only matters when we will actually compose an answer
             if want_answer and have_analysis and not sufficient and analyzed:
                 self._log("Final assess after budget/exhaustion...")
                 sufficient, gap = self.pulse_while(lambda: assess_sufficiency(c, query, analyzed, model=a_model))
@@ -1489,6 +1585,7 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_stream({"type": "error", "error": f"Download failed: {last_err}"})
         self.send_stream({"type": "done", "aborted": True})
 
+
     # ---- ingest (streamed) ----
     def _ingest_stream(self, c, body):
         folder = Path(c["source_folder"])
@@ -1502,14 +1599,18 @@ class Handler(SimpleHTTPRequestHandler):
             if mode != "full" and existing.get("chunk_params") != params:
                 mode = "full"
                 self._log("Chunking parameters changed — forcing a full rebuild.", "warn")
+
             self._log(f"Ingest started ({mode}) — scanning {folder} ...")
             self.send_stream({
                 "type": "progress", "phase": "ingest", "percent": 2,
                 "text": ("Full rebuild requested. Scanning document folder..." if mode == "full"
                          else "Scanning for new or changed documents (saved vectors are reused)..."),
             })
-            files = [p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in allowed and DATA not in p.parents]
+
+            files = [p for p in folder.rglob("*")
+                     if p.is_file() and p.suffix.lower() in allowed and DATA not in p.parents]
             current_sigs = {str(p): file_signature(p) for p in files}
+
             reused, changed = [], files
             if mode != "full":
                 old_sigs = existing.get("files", {})
@@ -1523,17 +1624,20 @@ class Handler(SimpleHTTPRequestHandler):
                 dropped = len([s for s in old_sigs if s not in current_sigs])
                 self.send_stream({
                     "type": "progress", "phase": "ingest", "percent": 8,
-                    "text": (f"Reusing {len(reused)} saved passage(s) from {len(files) - len(changed)} unchanged document(s). "
+                    "text": (f"Reusing {len(reused)} saved passage(s) from "
+                             f"{len(files) - len(changed)} unchanged document(s). "
                              f"Updating {len(changed)} changed/new document(s)"
                              + (f" and dropping {dropped} removed file(s)." if dropped else ".")),
                 })
-                self._log(f"{len(files)} file(s) found — {len(reused)} passage(s) reusable, {len(changed)} to process.")
+                self._log(f"{len(files)} file(s) found — {len(reused)} passage(s) reusable, "
+                          f"{len(changed)} to process.")
             else:
                 self.send_stream({
                     "type": "progress", "phase": "ingest", "percent": 8,
                     "text": f"Found {len(files)} supported document(s). Creating passages...",
                 })
                 self._log(f"{len(files)} supported document(s) found.")
+
             new_chunks, errors = [], []
             for number, p in enumerate(changed, 1):
                 if self._gone:
@@ -1550,15 +1654,20 @@ class Handler(SimpleHTTPRequestHandler):
                     "percent": 8 + round(20 * number / max(len(changed), 1)),
                     "text": f"Processed {number} of {len(changed)} document(s): {p.name}",
                 })
+
             if not new_chunks and not reused:
                 self._log("No supported text found in the selected folder.", "error")
-                self.send_stream({"type": "error", "error": "No supported text was found in the selected folder."})
+                self.send_stream({"type": "error",
+                                  "error": "No supported text was found in the selected folder."})
                 return
+
             embedding_model = resolved(c, "embedding")
+
             if new_chunks:
                 self.send_stream({
                     "type": "progress", "phase": "ingest", "percent": 30,
-                    "text": f"Creating semantic vectors for {len(new_chunks)} new/changed passage(s) using {HARDWARE['label']}...",
+                    "text": (f"Creating semantic vectors for {len(new_chunks)} new/changed "
+                             f"passage(s) using {HARDWARE['label']}..."),
                 })
                 self._log(f"Embedding {len(new_chunks)} passage(s) with {embedding_model}...")
                 batch_size = max(16, HARDWARE["embedding_workers"] * 16)
@@ -1579,13 +1688,17 @@ class Handler(SimpleHTTPRequestHandler):
                 self._log("No new passages to embed — reusing all saved vectors.", "ok")
                 self.send_stream({"type": "progress", "phase": "ingest", "percent": 80,
                                   "text": "No new passages to embed. Reusing all saved vectors..."})
+
             docs = [d for d in (reused + new_chunks) if d.get("path") in current_sigs]
             if not docs:
-                self.send_stream({"type": "error", "error": "No supported text was found in the selected folder."})
+                self.send_stream({"type": "error",
+                                  "error": "No supported text was found in the selected folder."})
                 return
+
             self._log(f"Building exact-keyword index over {len(docs)} passage(s)...")
             self.send_stream({"type": "progress", "phase": "ingest", "percent": 87,
                               "text": f"Building exact-keyword index over {len(docs)} passage(s)..."})
+
             lengths, document_frequency, postings = [], Counter(), {}
             for item_index, item in enumerate(docs):
                 counts = Counter(words(item["text"]))
@@ -1599,20 +1712,82 @@ class Handler(SimpleHTTPRequestHandler):
                 "document_frequency": document_frequency,
                 "postings": postings,
             }
+
             self.send_stream({"type": "progress", "phase": "ingest", "percent": 96,
                               "text": "Saving portable index to data/index.json..."})
+
             with lock:
                 save_json(INDEX_FILE, {
                     "version": 2, "chunks": docs, "lexical": lexical,
                     "embedding_model": embedding_model, "files": current_sigs,
                     "chunk_params": params, "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
                 })
-            self._log(f"Index saved — {len(docs)} passages, {len({x['path'] for x in docs})} documents.", "ok")
+
+            invalidate_index_cache()
+
+            lancedb_ok = False
+            if c.get("use_lancedb") and LANCEDB_AVAILABLE:
+                try:
+                    import numpy as np
+                    self._log("Initializing LanceDB vector database...", "info")
+                    self.send_stream({"type": "progress", "phase": "ingest", "percent": 97,
+                                      "text": "Preparing LanceDB vector database..."})
+
+                    db = lancedb.connect(str(DATA / "lancedb"))
+                    lancedb_data = [
+                        {"id": d["id"],
+                         "vector": np.array(d["embedding"], dtype=np.float32)}
+                        for d in docs if d.get("embedding")
+                    ]
+
+                    if lancedb_data:
+                        ldb_batch = 2000
+                        total_batches = (len(lancedb_data) + ldb_batch - 1) // ldb_batch
+                        for i in range(total_batches):
+                            batch = lancedb_data[i * ldb_batch : (i + 1) * ldb_batch]
+                            if i == 0:
+                                db.create_table("chunks", data=batch, mode="overwrite")
+                            else:
+                                tbl = db.open_table("chunks")
+                                tbl.add(batch)
+                            done_count = min((i + 1) * ldb_batch, len(lancedb_data))
+                            pct = 97 + max(1, int(3 * done_count / len(lancedb_data)))
+                            self.send_stream({
+                                "type": "progress", "phase": "ingest",
+                                "percent": min(pct, 99),
+                                "text": f"LanceDB: {done_count:,} / {len(lancedb_data):,} vectors written..."
+                            })
+                            self._log(f"LanceDB: {done_count:,}/{len(lancedb_data):,} vectors saved.")
+
+                    lancedb_ok = True
+                    self._log("LanceDB vector index ready.", "ok")
+
+                except Exception as ldb_exc:
+                    self._log(f"LanceDB write failed (non-fatal): {ldb_exc}", "warn")
+                    ldb_path = DATA / "lancedb"
+                    if ldb_path.exists():
+                        try:
+                            shutil.rmtree(ldb_path)
+                        except OSError:
+                            pass
+            elif c.get("use_lancedb") and not LANCEDB_AVAILABLE:
+                self._log("LanceDB not installed — run Install_LanceDB.bat. Skipping vector DB.", "warn")
+
+            # ---- final done event ----
+            self._log(f"Index saved — {len(docs)} passages, "
+                      f"{len({x['path'] for x in docs})} documents.", "ok")
             self.send_stream({
-                "type": "done", "documents": len({x["path"] for x in docs}), "chunks": len(docs),
-                "reused": len(reused), "new": len(new_chunks), "mode": mode, "errors": errors,
+                "type": "done",
+                "documents": len({x["path"] for x in docs}),
+                "chunks": len(docs),
+                "reused": len(reused),
+                "new": len(new_chunks),
+                "mode": mode,
+                "errors": errors,
+                "lancedb": lancedb_ok,
                 "performance": HARDWARE["label"],
             })
+
         except Exception as e:
             self._log(f"Ingest failed — {e}", "error")
             try:
@@ -1728,9 +1903,17 @@ class Handler(SimpleHTTPRequestHandler):
                     "server": srv.describe(),
                 }, 200 if ok else 500)
 
-            if self.path == "/api/download-model":
-                self._download_model_stream((body.get("id") or "").strip())
+            if self.path == "/api/ingest-stream":
+                c = settings()
+                self._ingest_stream(c, body)
                 return
+
+
+            if self.path == "/api/ingest-stream":
+                c = settings()
+                self._ingest_stream(c, body)
+                return
+
 
             if self.path == "/api/settings":
                 current = settings()
@@ -1738,11 +1921,12 @@ class Handler(SimpleHTTPRequestHandler):
                 updated = {key: value for key, value in body.items() if key in allowed}
                 if updated.get("source_folder") and not Path(updated["source_folder"]).is_dir():
                     return self.send_json({"error": "Enter an existing local document folder path."}, 400)
-                for key in ("use_llm_rerank", "adaptive_rag", "use_hyde"):
+                for key in ("use_llm_rerank", "adaptive_rag", "use_hyde", "use_lancedb"):
                     if key in updated:
                         updated[key] = str(updated[key]).lower() == "true"
                 save_json(SETTINGS_FILE, {**current, **updated})
                 return self.send_json(settings())
+
             if self.path == "/api/load-model":
                 key = (body.get("model") or "").strip()
                 if not key:
@@ -1821,14 +2005,37 @@ class Handler(SimpleHTTPRequestHandler):
                                 if p.is_file() and p.suffix.lower() in allowed and DATA not in p.parents}
                 with lock:
                     save_json(INDEX_FILE, {"version": 2, "chunks": docs, "lexical": lexical,
-                                           "embedding_model": embedding_model, "files": current_sigs,
-                                           "chunk_params": chunk_params_sig(c),
-                                           "updated": time.strftime("%Y-%m-%d %H:%M:%S")})
-                return self.send_json({"documents": len({x["path"] for x in docs}), "chunks": len(docs),
-                                       "errors": errors, "performance": HARDWARE["label"]})
-            if self.path == "/api/ingest-stream":
-                self._ingest_stream(settings(), body)
-                return
+                        "embedding_model": embedding_model, "files": current_sigs,
+                        "chunk_params": chunk_params_sig(c),
+                        "updated": time.strftime("%Y-%m-%d %H:%M:%S")})
+                invalidate_index_cache()
+
+                # LanceDB (non-fatal — must not abort the response)
+                lancedb_ok = False
+                if c.get("use_lancedb") and LANCEDB_AVAILABLE:
+                    try:
+                        import numpy as np
+                        db = lancedb.connect(str(DATA / "lancedb"))
+                        db.create_table("chunks", data=[
+                            {"id": d["id"],
+                             "vector": np.array(d["embedding"], dtype=np.float32)}
+                            for d in docs if d.get("embedding")
+                        ], mode="overwrite")
+                        lancedb_ok = True
+                    except Exception:
+                        ldb_path = DATA / "lancedb"
+                        if ldb_path.exists():
+                            try:
+                                shutil.rmtree(ldb_path)
+                            except OSError:
+                                pass
+
+                return self.send_json({"documents": len({x["path"] for x in docs}),
+                                       "chunks": len(docs),
+                                       "errors": errors,
+                                       "lancedb": lancedb_ok,
+                                       "performance": HARDWARE["label"]})
+            
             if self.path == "/api/search":
                 c = settings()
                 query = body.get("query", "").strip()
@@ -1844,6 +2051,7 @@ class Handler(SimpleHTTPRequestHandler):
                         {"role": "user", "content": evidence_prompt(query, context_limited_evidence(c, results))},
                     ], model=c["chat_model"])
                 return self.send_json({"answer": answer, "results": [public(r) for r in results]})
+            
             if self.path == "/api/answer-stream":
                 c = settings()
                 query = text(body.get("query"))
@@ -1857,14 +2065,22 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_stream_start()
                 self._answer_stream(c, query, want_answer, evidence_only, bool(body.get("adaptive", True)))
                 return
+            
             if self.path == "/api/index/clear":
                 for candidate in (INDEX_FILE, INDEX_FILE.with_suffix(".tmp")):
                     try:
                         candidate.unlink()
-                    except FileNotFoundError:
-                        pass
                     except OSError:
                         pass
+                
+                db_path = DATA / "lancedb"
+                if db_path.exists():
+                    try:
+                        shutil.rmtree(db_path)
+                    except OSError:
+                        pass
+                
+                invalidate_index_cache()
                 return self.send_json({"cleared": True})
             self.send_json({"error": "Not found"}, 404)
         except Exception as e:

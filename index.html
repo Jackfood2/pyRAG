@@ -432,6 +432,7 @@ input[type=range]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;bac
       <div class="set-row"><label>File types</label><input type="text" id="fileTypes"></div>
       <div class="set-row"><label>Passage size (chars)</label><input type="number" id="chunkSize" min="200" max="4000"></div>
       <div class="set-row"><label>Passage overlap (chars)</label><input type="number" id="chunkOverlap" min="0" max="2000"></div>
+      <div class="set-row"><label>Use LanceDB vector database</label><span class="switch on" id="sLanceDB"></span></div>
       <div class="hint" style="margin:-2px 0 10px">Changing size or overlap triggers a clean rebuild. Unchanged documents keep their saved vectors.</div>
       <div class="idx-actions">
         <button class="mini primary" id="ingestInc">Add / update</button>
@@ -495,9 +496,9 @@ function el(tag, o){
   for (const k in o){
     if (k === "class" || k === "text") continue;
     if (k.indexOf("data-") === 0){ n.setAttribute(k, o[k]); continue; }
-    if (k === "value"){ n.value = o[k]; n.setAttribute("value", o[k]); continue; } // <-- the fix
+    if (k === "value"){ n.value = o[k]; n.setAttribute("value", o[k]); continue; }
     if (o[k] === false || o[k] == null) continue;
-    n.setAttribute(k, o[k] === true ? "" : o[k]);   // any other attr (type, hidden, for…)
+    n.setAttribute(k, o[k] === true ? "" : o[k]);
   }
   return n;
 }
@@ -851,8 +852,8 @@ const embedSel=$("embedModelSel"), rerankSel=$("rerankModelSel");
 const ctxLabel=m=>{const c=m.ctx||0;return c>=1024?(c/1024)+"k ctx":c+" ctx";};
 function modelThreshold(kind,m){
   const srv=localServers[kind];
-  if(srv && srv.file===m.id && srv.effective_ctx) return srv.max_chars;  // live effective ctx
-  return m.max_chars;                                                     // nominal ctx
+  if(srv && srv.file===m.id && srv.effective_ctx) return srv.max_chars; 
+  return m.max_chars;                                                     
 }
 function setPill(id,ok,label){const p=$(id);if(!p)return;p.querySelector(".dot").className="dot "+(ok?"on":"warn");if(label!=null)p.querySelector("b").textContent=label;}
 function renderLocalServerStatus(){
@@ -935,8 +936,13 @@ function fillSettings(s){
   setVal("chunkSize",s.chunk_size); setVal("chunkOverlap",s.chunk_overlap);
   semWeight.value=Math.round((+s.semantic_weight||0.72)*100); updSem();
   setVal("candCount",s.candidate_count); setVal("checkpoint",s.rerank_count); setVal("maxChecks",s.max_candidate_checks);
-  setSwitch("sRerank",s.use_llm_rerank); setSwitch("sHyde",s.use_hyde); setSwitch("sAdaptive",s.adaptive_rag);
+  
+  setSwitch("sRerank",s.use_llm_rerank); 
+  setSwitch("sHyde",s.use_hyde); 
+  setSwitch("sAdaptive",s.adaptive_rag);
+  setSwitch("sLanceDB",s.use_lancedb !== false); // default to true if missing
   setSwitch("tgAdaptive",s.adaptive_rag);
+  
   setVal("temp",s.answer_temperature); setVal("maxTok",s.answer_tokens); setVal("ctxWin",s.context_window);
   analysisModel=s.analysis_model||""; chatModel=s.chat_model||"";
   setSelectVal("analysisModelSel",analysisModel); setSelectVal("chatModelSel",chatModel);
@@ -948,6 +954,7 @@ function gather(){
     semantic_weight:sw/100, keyword_weight:(100-sw)/100,
     candidate_count:+val("candCount"), rerank_count:+val("checkpoint"), max_candidate_checks:+val("maxChecks"),
     use_llm_rerank:switchOn("sRerank"), use_hyde:switchOn("sHyde"), adaptive_rag:switchOn("sAdaptive"),
+    use_lancedb:switchOn("sLanceDB"),
     answer_temperature:+val("temp"), answer_tokens:+val("maxTok"), context_window:+val("ctxWin"),
     analysis_model:analysisModel, chat_model:chatModel };
 }
