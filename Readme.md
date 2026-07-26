@@ -1,6 +1,3 @@
-# README.md
-
-```markdown
 # Offline RAG — Local Document Intelligence
 
 > **100% Private, Portable, and Local Retrieval-Augmented Generation Workstation**  
