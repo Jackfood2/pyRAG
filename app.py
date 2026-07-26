@@ -926,8 +926,18 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.close_connection = True
         self._gone = False
+        # Push every flush straight to the wire (defeats Nagle / socket buffering
+        # so frames arrive the instant they are written, not in a lump at close).
         try:
-            self.wfile.write(b": stream open\n")
+            import socket as _sk
+            self.connection.setsockopt(_sk.IPPROTO_TCP, _sk.TCP_NODELAY, 1)
+        except Exception:
+            pass
+        try:
+            # bytes((10, 10)) == b"\n\n" == the blank line that terminates an
+            # SSE frame. Written as decimal byte values so NO editor can ever
+            # "pretty-print" or collapse it. Do NOT replace this with \n\n.
+            self.wfile.write(b": stream open" + bytes((10, 10)))
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):
             self._gone = True
@@ -937,7 +947,10 @@ class Handler(SimpleHTTPRequestHandler):
             return
         try:
             payload = json.dumps(data, ensure_ascii=False)
-            self.wfile.write(f"data: {payload}\n".encode("utf-8"))
+            # One event = b"data: " + json + TWO line-feeds. The second LF
+            # (the empty line) is the ONLY thing that makes the browser hand
+            # the event to JavaScript. One LF = buffered forever = blank UI.
+            self.wfile.write(b"data: " + payload.encode("utf-8") + bytes((10, 10)))
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):
             self._gone = True
