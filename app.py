@@ -74,7 +74,9 @@ DEFAULTS = {
     "max_row_chars": 5000,
     "adaptive_rag": True,
     "use_hyde": True,
-    "use_lancedb": True,               # <--- New setting added for LanceDB
+    "use_lancedb": True, 
+    "gpu_offload": True,  
+    "gpu_layers": 99,   
     "fast_path_score": 0.82,           
     "memory_fact_limit": 18,
     "context_window": 8192,
@@ -123,6 +125,17 @@ RUNTIME_DIR = ROOT / "runtime"
 LLAMA_SERVER = RUNTIME_DIR / ("llama-server.exe" if os.name == "nt" else "llama-server")
 MODELS_DIR = ROOT / "models"
 LOG_DIR = DATA / "logs"
+
+def detect_gpu_backend():
+    """Return 'cuda', 'vulkan' or 'cpu' from the backend DLLs sitting in runtime/."""
+    if not RUNTIME_DIR.exists():
+        return "cpu"
+    names = {p.name.lower() for p in RUNTIME_DIR.iterdir()}
+    if any(n == "ggml-cuda.dll" or n.startswith("ggml-cuda") for n in names):
+        return "cuda"
+    if any(n == "ggml-vulkan.dll" or n.startswith("ggml-vulkan") for n in names):
+        return "vulkan"
+    return "cpu"
 
 EMBEDDING_PORT = 8787
 RERANK_PORT = 8788
@@ -198,12 +211,16 @@ class LocalServer:
         self.state = "off"
         self.error = ""
         self._lock = threading.Lock()
+        self.gpu_layers = 0          # layers actually offloaded this start (0 = CPU)
+        self.gpu_fell_back = False   # True if we tried GPU and had to drop to CPU
 
-    def build_args(self, threads):
+    def build_args(self, threads, layers=0):
         ctx = min(int(self.nominal_ctx or 2048), MAX_SERVER_CTX)
         args = [str(LLAMA_SERVER), "-m", str(MODELS_DIR / self.file),
-                "--host", "127.0.0.1", "--port", str(self.port),
-                "-t", str(threads), "-c", str(ctx), "-b", str(ctx), "-ub", str(ctx)]
+            "--host", "127.0.0.1", "--port", str(self.port),
+            "-t", str(threads), "-c", str(ctx), "-b", str(ctx), "-ub", str(ctx)]
+        if layers and layers > 0:
+            args += ["-ngl", str(int(layers))]      # GPU layer offload
         args.append("--embedding" if self.kind == "embedding" else "--reranking")
         return args
 
@@ -221,12 +238,14 @@ class LocalServer:
                 pass
         self.state = "off"
 
-    def start(self, file_id, nominal_ctx, threads):
+    def start(self, file_id, nominal_ctx, threads, gpu_layers=0):
         self.stop()
         self.file = file_id
         self.nominal_ctx = nominal_ctx
         self.eff_ctx = None
         self.error = ""
+        self.gpu_layers = int(gpu_layers or 0)
+        self.gpu_fell_back = False
         if not (MODELS_DIR / file_id).exists():
             self.state = "missing"
             self.error = f"{file_id} is not in the models folder yet."
@@ -239,14 +258,27 @@ class LocalServer:
         log = open(LOG_DIR / f"{self.kind}-server.log", "ab", buffering=0)
         flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
         try:
-            self.proc = subprocess.Popen(self.build_args(threads),
-                                         stdin=subprocess.DEVNULL, creationflags=flags)
+            self.proc = subprocess.Popen(self.build_args(threads, self.gpu_layers),
+                stdin=subprocess.DEVNULL, creationflags=flags)
         except Exception as exc:
             self.state = "error"
             self.error = str(exc)
             return False
         self.state = "starting"
         return True
+
+    def start_with_fallback(self, file_id, nominal_ctx, threads, gpu_layers):
+        """Start on GPU if requested; if the GPU fails to init, retry on CPU."""
+        ok = self.start(file_id, nominal_ctx, threads, gpu_layers)
+        if ok:
+            ok = self.wait_ready(120)
+        if (not ok) and gpu_layers and gpu_layers > 0:
+            self.gpu_fell_back = True
+            print(f"[{self.kind}] GPU offload failed to start - falling back to CPU.")
+            ok = self.start(file_id, nominal_ctx, threads, 0)
+            if ok:
+                ok = self.wait_ready(120)
+        return ok
 
     def health(self):
         if self.proc is not None and self.proc.poll() is not None:
@@ -289,8 +321,11 @@ class LocalServer:
 
     def describe(self):
         return {"kind": self.kind, "port": self.port, "file": self.file,
-                "state": self.state, "error": self.error,
-                "nominal_ctx": self.nominal_ctx, "effective_ctx": self.eff_ctx}
+            "state": self.state, "error": self.error,
+            "nominal_ctx": self.nominal_ctx, "effective_ctx": self.eff_ctx,
+            "gpu_backend": detect_gpu_backend(),
+            "gpu_layers": self.gpu_layers,
+            "gpu_fell_back": self.gpu_fell_back}
 
 EMBED_SERVER = LocalServer("embedding", EMBEDDING_PORT)
 RERANK_SERVER = LocalServer("reranker", RERANK_PORT)
@@ -300,11 +335,12 @@ def _server_for(kind):
 
 def _start_one(kind, cfg):
     file_id = cfg.get("embedding_model" if kind == "embedding" else "rerank_model") or \
-              (DEFAULT_EMBED_FILE if kind == "embedding" else DEFAULT_RERANK_FILE)
+        (DEFAULT_EMBED_FILE if kind == "embedding" else DEFAULT_RERANK_FILE)
     entry = catalog_entry(file_id) or {"id": file_id, "ctx": 2048}
     srv = _server_for(kind)
-    if srv.start(entry["id"], entry.get("ctx", 2048), HARDWARE["cores"]):
-        srv.wait_ready(120)
+    gpu_on = bool(cfg.get("gpu_offload", True)) and detect_gpu_backend() != "cpu"
+    layers = positive(cfg.get("gpu_layers"), 99, 0, 999) if gpu_on else 0
+    srv.start_with_fallback(entry["id"], entry.get("ctx", 2048), HARDWARE["cores"], layers)
 
 def _start_local_servers(cfg, wait=False):
     def run():
@@ -551,7 +587,28 @@ def chunks_for(path, config):
     elif ext == ".docx":
         units = [("Document", None, read_docx(path))]
     elif ext in (".xlsx", ".xlsm"):
-        units = list(read_xlsx(path))
+        raw_units = list(read_xlsx(path))
+        units = []
+        BATCH_SIZE = 15  # Group 15 Excel rows into 1 passage chunk
+        current_batch = []
+        current_sheet = None
+
+        for sheet, row_num, line in raw_units:
+            if current_sheet is not None and (sheet != current_sheet or len(current_batch) >= BATCH_SIZE):
+                first_row = current_batch[0][1]
+                last_row = current_batch[-1][1]
+                row_range = f"Rows {first_row}-{last_row}" if len(current_batch) > 1 else first_row
+                units.append((current_sheet, row_range, "\n".join(item[2] for item in current_batch)))
+                current_batch = []
+            
+            current_sheet = sheet
+            current_batch.append((sheet, row_num, line))
+
+        if current_batch:
+            first_row = current_batch[0][1]
+            last_row = current_batch[-1][1]
+            row_range = f"Rows {first_row}-{last_row}" if len(current_batch) > 1 else first_row
+            units.append((current_sheet, row_range, "\n".join(item[2] for item in current_batch)))
     elif ext == ".pdf":
         units = [("PDF", None, read_pdf(path))]
     else:
@@ -677,9 +734,10 @@ def embed(config, inputs):
         _EMBED_CACHE[item] = vector
         return vector
 
+
     if len(inputs) < 2:
         return [one(item) for item in inputs]
-    with ThreadPoolExecutor(max_workers=1) as pool:
+    with ThreadPoolExecutor(max_workers=HARDWARE["embedding_workers"]) as pool:
         return list(pool.map(one, inputs))
 
 
@@ -1816,8 +1874,9 @@ class Handler(SimpleHTTPRequestHandler):
                 "selection": {"embedding": cfg.get("embedding_model"), "reranker": cfg.get("rerank_model")},
                 "servers": servers,
                 "constants": {"est_chars_per_token": EST_CHARS_PER_TOKEN, "ctx_safety": CTX_SAFETY,
-                              "rerank_query_reserve": RERANK_QUERY_RESERVE},
+                    "rerank_query_reserve": RERANK_QUERY_RESERVE},
                 "threads": HARDWARE["cores"],
+                "gpu_backend": detect_gpu_backend(),
             })
 
         if self.path == "/api/local-model-status":
@@ -1833,6 +1892,7 @@ class Handler(SimpleHTTPRequestHandler):
 
         if self.path == "/api/settings":
             return self.send_json(settings())
+
         if self.path == "/api/options":
             base = ROOT.parent.parent
             folders = [ROOT.parent, base]
@@ -1846,7 +1906,9 @@ class Handler(SimpleHTTPRequestHandler):
             })
         if self.path == "/api/status":
             idx = load(INDEX_FILE, {"chunks": [], "updated": None})
-            return self.send_json({"chunks": len(idx["chunks"]), "updated": idx.get("updated"), "hardware": HARDWARE["label"]})
+            return self.send_json({"chunks": len(idx["chunks"]), "updated": idx.get("updated"),
+                "hardware": HARDWARE["label"], "gpu_backend": detect_gpu_backend()})
+
         if self.path == "/api/models":
             state, detail = "connected", ""
             try:
@@ -1921,10 +1983,13 @@ class Handler(SimpleHTTPRequestHandler):
                 updated = {key: value for key, value in body.items() if key in allowed}
                 if updated.get("source_folder") and not Path(updated["source_folder"]).is_dir():
                     return self.send_json({"error": "Enter an existing local document folder path."}, 400)
-                for key in ("use_llm_rerank", "adaptive_rag", "use_hyde", "use_lancedb"):
+                for key in ("use_llm_rerank", "adaptive_rag", "use_hyde", "use_lancedb", "gpu_offload"):
                     if key in updated:
                         updated[key] = str(updated[key]).lower() == "true"
+                gpu_changed = any(k in updated for k in ("gpu_offload", "gpu_layers"))
                 save_json(SETTINGS_FILE, {**current, **updated})
+                if gpu_changed:   # apply GPU offload change without a full app restart
+                    threading.Thread(target=lambda: _start_local_servers(settings(), wait=True), daemon=True).start()
                 return self.send_json(settings())
 
             if self.path == "/api/load-model":
@@ -2094,5 +2159,6 @@ if __name__ == "__main__":
     os.chdir(ROOT)
     _start_local_servers(settings(), wait=False)
     atexit.register(_shutdown_local_servers)
+    print(f"GPU backend: {detect_gpu_backend().upper()}")
     print("Offline RAG: http://127.0.0.1:8765")
     ThreadingHTTPServer(("127.0.0.1", 8765), Handler).serve_forever()
