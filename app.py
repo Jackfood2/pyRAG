@@ -194,7 +194,7 @@ class LocalServer:
         log = open(LOG_DIR / f"{self.kind}-server.log", "ab", buffering=0)
         flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
         try:
-            self.proc = subprocess.Popen(self.build_args(threads), stdout=log, stderr=log,
+            self.proc = subprocess.Popen(self.build_args(threads),
                                          stdin=subprocess.DEVNULL, creationflags=flags)
         except Exception as exc:
             self.state = "error"
@@ -634,7 +634,7 @@ def embed(config, inputs):
 
     if len(inputs) < 2:
         return [one(item) for item in inputs]
-    with ThreadPoolExecutor(max_workers=HARDWARE["embedding_workers"]) as pool:
+    with ThreadPoolExecutor(max_workers=1) as pool:
         return list(pool.map(one, inputs))
 
 
