@@ -1,38 +1,5 @@
 #!/usr/bin/env python3
-"""Portable, dependency-free local RAG workstation for LM Studio.
 
-v4 — ACCUMULATE → ASSESS → REFORMULATE pipeline (Corrective / CRAG style).
-
-Design change vs v3: verification NO LONGER REJECTS passages. The old gate
-(strict extractor + negative-word filter + duplicate filter) could throw away
-every candidate and produce 0 evidence / a blank answer — the worst possible
-outcome. The new pipeline never drops evidence:
-
-  01 UNDERSTAND  rewrite + HyDE variants
-  02 RETRIEVE    fused semantic+keyword search, in waves
-  03 ANALYZE     the LLM summarises EVERY retrieved passage and tags it
-                 [ANSWERS]/[PARTIAL]/[RELATED]/[OFFTOPIC]; the summary is
-                 ALWAYS kept (off-topic passages become contrast notes)
-  04 ASSESS      after every `target` analyses a cheap LLM call decides whether
-                 the accumulated notes answer the question; if NOT, the gap it
-                 reports becomes a new search query, the semantic floor is
-                 relaxed and the candidate budget grows -> another wave
-  05 ANSWER      built from ALL notes (ordered by relevance, deduped only when
-                 composing the prompt); related/off-topic notes let the model
-                 EXPLAIN the gap instead of refusing
-
-Hard stops: the user's max-verification-checks budget, or corpus exhaustion.
-The "evidence target" setting is repurposed as the assess-checkpoint interval.
-
-Because nothing is rejected, the per-candidate `fact` field is never empty, so
-the text streamed into a card can no longer disappear. Each verify_done event
-also carries `raw` (exact model stream) and `parsed` (cleaned summary) for a
-dedicated "model output" panel in the UI.
-
-SSE transport is fixed (frames end with the mandatory blank line; HTTP/1.1 with
-Connection: close and X-Accel-Buffering: no) so fast back-to-back events are
-never coalesced or dropped by the client.
-"""
 import json
 import math
 import os
@@ -56,7 +23,6 @@ ROOT = Path(__file__).resolve().parent
 VENDOR = ROOT / "vendor"
 if VENDOR.exists():
     sys.path.insert(0, str(VENDOR))
-
 DATA = ROOT / "data"
 DATA.mkdir(exist_ok=True)
 SETTINGS_FILE, INDEX_FILE = DATA / "settings.json", DATA / "index.json"
@@ -66,20 +32,21 @@ RERANK_URL = "http://127.0.0.1:8788"
 LOCAL_EMBEDDING_MODEL = "Bundled Nomic Embed v1.5"
 LOCAL_RERANK_MODEL = "Bundled BGE Reranker v2-m3"
 
-MAX_WAVES = 5                 # corrective-retrieval waves before we give up and answer anyway
+MAX_WAVES = 5                 # corrective-retrieval waves before we answer anyway
 WAVE_EXTRA_CANDIDATES = 8     # candidate budget grows by this each wave
-ASSESS_CONFIDENCE_STOP = 0.8  # assess call confidence at/above this stops early even if can_answer is false
+ASSESS_CONFIDENCE_STOP = 0.8  # assess confidence at/above this stops early
 
 DEFAULTS = {
     "source_folder": str(ROOT.parent),
     "lmstudio_url": "http://127.0.0.1:1234/v1",
     "embedding_model": LOCAL_EMBEDDING_MODEL,
-    "chat_model": "",
+    "analysis_model": "",          # small/fast model: rewrite + analyze + assess
+    "chat_model": "",              # larger model: final cited answer only
     "rerank_model": LOCAL_RERANK_MODEL,
     "chunk_size": 900,
     "chunk_overlap": 140,
     "candidate_count": 32,
-    "rerank_count": 4,                 # repurposed: assess-checkpoint interval (analyses between checks)
+    "rerank_count": 4,                 # repurposed: assess-checkpoint interval
     "max_candidate_checks": 24,        # hard cap on passages analysed
     "semantic_weight": 0.72,
     "keyword_weight": 0.28,
@@ -90,7 +57,7 @@ DEFAULTS = {
     "max_row_chars": 5000,
     "adaptive_rag": True,
     "use_hyde": True,
-    "fast_path_score": 0.82,           # unused by v4 (no evidence is skipped); kept for settings compatibility
+    "fast_path_score": 0.82,           # legacy, unused by v5
     "memory_fact_limit": 18,
     "context_window": 8192,
 }
@@ -111,7 +78,6 @@ _MONTHS = {"january", "february", "march", "april", "may", "june", "july",
 _DOW = {"monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
         "mon", "tue", "tues", "wed", "thu", "thur", "thurs", "fri", "sat", "sun"}
 
-# Relevance tags the analyser may emit. Order = priority for the answer prompt.
 REL_RANK = {"ANSWERS": 3, "PARTIAL": 2, "RELATED": 1, "OFFTOPIC": 0}
 REL_LABEL = {
     "ANSWERS":  "directly answers the question",
@@ -144,6 +110,8 @@ def settings():
         config["source_folder"] = DEFAULTS["source_folder"]
     if config.get("chat_model") == "auto":
         config["chat_model"] = ""
+    if config.get("analysis_model") == "auto":
+        config["analysis_model"] = ""
     return config
 
 
@@ -256,7 +224,6 @@ def read_xlsx(path):
         return
     except ImportError:
         pass
-
     with zipfile.ZipFile(path) as z:
         shared = []
         if "xl/sharedStrings.xml" in z.namelist():
@@ -332,7 +299,6 @@ def chunks_for(path, config):
         units = [("PDF", None, read_pdf(path))]
     else:
         return []
-
     out = []
     for section, row, content in units:
         content = re.sub(r"[^\S\r\n]+", " ", str(content or ""))
@@ -361,7 +327,7 @@ def chunks_for(path, config):
             elif len(sentence) > size:
                 if current:
                     pieces.append(current)
-                current = ""
+                    current = ""
                 for start in range(0, len(sentence), size - overlap or size):
                     piece = sentence[start:start + size]
                     if piece:
@@ -408,13 +374,14 @@ def local_api(url, endpoint, body):
 
 
 def resolved(config, purpose):
+    """Resolve a model id for embedding or for the final answer (chat)."""
     if purpose == "embedding":
         return LOCAL_EMBEDDING_MODEL
-    selected = config["chat_model"]
+    selected = config.get("chat_model", "")
     if selected:
         return selected
     if purpose == "chat":
-        raise RuntimeError("Choose an answer model in Settings, or use Evidence only.")
+        raise RuntimeError("Choose a final answer model in Settings, or use Evidence only.")
     try:
         available = lmstudio_api(config, "/api/v1/models", timeout=3).get("models", [])
         for model in available:
@@ -428,6 +395,11 @@ def resolved(config, purpose):
         if (purpose == "embedding") == ("embed" in name.lower()):
             return name
     raise RuntimeError(f"No loaded {purpose} model found in LM Studio.")
+
+
+def analysis_model_for(config):
+    """The model used for rewrite/analyze/assess. Falls back to the answer model."""
+    return (config.get("analysis_model") or "").strip() or (config.get("chat_model") or "").strip()
 
 
 def embed(config, inputs):
@@ -488,6 +460,42 @@ def rerank_once(query, items):
         return items
 
 
+# ---- model introspection for verified loading ----
+def _lm_models(config):
+    try:
+        return lmstudio_api(config, "/api/v1/models", timeout=4).get("models", [])
+    except Exception:
+        return []
+
+
+def _candidate_ids(models, key):
+    """All identifiers LM Studio knows this model by, plus whether it is loaded."""
+    cands, loaded = [], False
+    for m in models:
+        if m.get("type") != "llm":
+            continue
+        if key in (m.get("key"), m.get("path"), m.get("display_name")):
+            if m.get("key"):
+                cands.append(m["key"])
+            if m.get("path"):
+                cands.append(m["path"])
+            loaded = loaded or bool(m.get("loaded_instances"))
+    if not cands:
+        cands = [key]
+    return list(dict.fromkeys(cands)), loaded
+
+
+def _loaded_set(models):
+    s = set()
+    for m in models:
+        if m.get("type") == "llm" and m.get("loaded_instances"):
+            if m.get("key"):
+                s.add(m["key"])
+            if m.get("path"):
+                s.add(m["path"])
+    return s
+
+
 # --------------------------------------------------------------------------- #
 #  retrieval
 # --------------------------------------------------------------------------- #
@@ -501,7 +509,6 @@ def retrieve(query, config, excluded=None, rerank=True):
         return [], "This index was created by an older version. Rebuild the index before searching."
     if indexed_model != resolved(config, "embedding"):
         return [], "This index was built with a different embedding model. Select the indexed model or rebuild the index."
-
     vector = embed(config, [query])[0]
     lexical_data = index["lexical"]
     lexical = [0.0] * len(corpus)
@@ -514,7 +521,6 @@ def retrieve(query, config, excluded=None, rerank=True):
             lexical[item_index] += (
                 idf * count * 2.2 / (count + 1.2 * (0.25 + 0.75 * length / max(lexical_data["average_length"], 1)))
             )
-
     semantic_rank = sorted(range(len(corpus)), key=lambda i: cosine(vector, corpus[i].get("embedding", [])), reverse=True)
     lexical_rank = sorted(range(len(corpus)), key=lambda i: lexical[i], reverse=True)
     fused = Counter()
@@ -522,7 +528,6 @@ def retrieve(query, config, excluded=None, rerank=True):
         fused[idx] += float(config.get("semantic_weight", 0.72)) / (60 + rank)
     for rank, idx in enumerate(lexical_rank, 1):
         fused[idx] += float(config.get("keyword_weight", 0.28)) / (60 + rank)
-
     candidates = positive(config.get("candidate_count"), 32, 4, 400)
     excluded = excluded or set()
     result = [
@@ -530,7 +535,6 @@ def retrieve(query, config, excluded=None, rerank=True):
         for idx in sorted(fused, key=fused.get, reverse=True)
         if corpus[idx].get("id") not in excluded
     ][:candidates]
-
     if rerank and config["use_llm_rerank"] and result:
         result = rerank_once(query, result)
     return result, None
@@ -551,7 +555,6 @@ def retrieve_fused(queries, config, on_variant=None, rerank_query=None, do_reran
             existing = items.get(item_id)
             if not existing or item.get("_semantic_score", 0) > existing.get("_semantic_score", 0):
                 items[item_id] = item
-
     ranked = []
     for item_id in sorted(fused, key=fused.get, reverse=True):
         item = dict(items[item_id])
@@ -565,12 +568,13 @@ def retrieve_fused(queries, config, on_variant=None, rerank_query=None, do_reran
 # --------------------------------------------------------------------------- #
 #  chat
 # --------------------------------------------------------------------------- #
-def chat(config, messages, tokens=None):
+def chat(config, messages, tokens=None, model=None):
+    use = model or resolved(config, "chat")
     response = api(
         config,
         "/chat/completions",
         {
-            "model": resolved(config, "chat"),
+            "model": use,
             "messages": messages,
             "temperature": float(config["answer_temperature"]),
             "max_tokens": tokens or positive(config["answer_tokens"], 900, 64, 8000),
@@ -582,8 +586,8 @@ def chat(config, messages, tokens=None):
     return content
 
 
-def json_reply(config, messages, tokens=300):
-    reply = chat(config, messages, tokens).strip()
+def json_reply(config, messages, tokens=300, model=None):
+    reply = chat(config, messages, tokens, model=model).strip()
     reply = re.sub(r"^```(?:json)?\s*|\s*```$", "", reply, flags=re.I).strip()
     start, end = reply.find("{"), reply.rfind("}")
     if start >= 0 and end >= start:
@@ -594,9 +598,10 @@ def json_reply(config, messages, tokens=300):
     return {"_raw": reply}
 
 
-def chat_stream(config, messages, tokens, on_delta):
+def chat_stream(config, messages, tokens, on_delta, model=None):
+    use = model or resolved(config, "chat")
     body = {
-        "model": resolved(config, "chat"),
+        "model": use,
         "messages": messages,
         "temperature": float(config["answer_temperature"]),
         "max_tokens": tokens,
@@ -627,30 +632,29 @@ def chat_stream(config, messages, tokens, on_delta):
 
 
 # --------------------------------------------------------------------------- #
-#  understand (query planning)
+#  understand (query planning)  -- analysis model
 # --------------------------------------------------------------------------- #
-def understand_query(config, query):
+def understand_query(config, query, model=None):
     q_clean = query.strip().lower()
     q_words = set(words(query))
     greetings = {"hi", "hello", "hey", "greetings", "good morning", "good afternoon", "good evening", "thanks", "thank you"}
     if q_clean in greetings or (len(q_words) <= 3 and bool(q_words & greetings)):
         return {"rewrite": query, "variants": [query], "retrieve": False, "is_greeting": True}
-
     instruction = (
         "You are a strict search query optimizer. Generate 1 to 3 concise alternative search queries to find relevant passages.\n"
         "CRITICAL RULE: NEVER invent, add, or guess cities, countries, or names that are NOT explicitly typed in the user prompt.\n"
-        'Also write a "hyde" field: one short hypothetical sentence that might answer the question (used only to improve retrieval).\n'
-        'Return JSON ONLY: {"rewrite": "best query", "variants": ["query 1", "query 2"], "hyde": "hypothetical answer"}.'
+        "Also write a \"hyde\" field: one short hypothetical sentence that might answer the question (used only to improve retrieval).\n"
+        "Return JSON ONLY: {\"rewrite\": \"best query\", \"variants\": [\"query 1\", \"query 2\"], \"hyde\": \"hypothetical answer\"}."
     )
     rewrite = query
     variants = [query]
     try:
-        data = json_reply(config, [{"role": "system", "content": instruction}, {"role": "user", "content": query}], 300)
+        data = json_reply(config, [{"role": "system", "content": instruction}, {"role": "user", "content": query}], 300, model=model)
         if isinstance(data, dict):
             r = text(data.get("rewrite"))[:600]
             if r and r.upper() not in ("NONE", "N/A"):
                 rewrite = r
-                variants = [rewrite]
+            variants = [rewrite]
             v_list = data.get("variants")
             if isinstance(v_list, list):
                 for candidate in v_list:
@@ -662,10 +666,8 @@ def understand_query(config, query):
                 variants.append(hyde)
     except Exception:
         pass
-
     if query.lower() not in {v.lower() for v in variants}:
         variants.append(query)
-
     q_tokens = set(words(query))
     safe, seen_low = [], set()
     for v in variants:
@@ -680,7 +682,7 @@ def understand_query(config, query):
 
 
 # --------------------------------------------------------------------------- #
-#  ANALYZE  (replaces the old rejecting verifier)
+#  ANALYZE  (never rejects)  -- analysis model
 # --------------------------------------------------------------------------- #
 _ANALYZE_SYSTEM = (
     "You are a meticulous document analyst. You read ONE source passage and describe, "
@@ -704,12 +706,9 @@ _ANALYZE_SYSTEM = (
 
 
 def _parse_analysis(reply):
-    """Return (summary, tag). The summary is NEVER empty — that is the whole point:
-    nothing the model wrote is discarded, so the UI card always has text to show."""
     raw = text(reply).strip()
     if not raw:
         return "(the model produced no analysis text)", "RELATED"
-
     tags = list(_TAG_RE.finditer(raw))
     if tags:
         tag = _norm_tag(tags[-1].group(1))
@@ -717,17 +716,13 @@ def _parse_analysis(reply):
     else:
         tag = "RELATED"
         summary = raw
-
-    summary = re.sub(r"\s{2,}", " ", summary).strip(" \n\t[]")
+    summary = re.sub(r"\s{2,}", " ", summary).strip("\n\t[]")
     if not summary:
         summary = f"(model returned only the relevance tag [{tag}]; no descriptive summary)"
     return summary[:1800], tag
 
 
-def analyze_passage(config, query, item, on_delta=None):
-    """Stream the model's per-passage analysis. Returns (summary, tag, raw_text).
-    On ANY failure we keep whatever streamed (or the raw passage) with tag RELATED —
-    there is no rejection path here."""
+def analyze_passage(config, query, item, on_delta=None, model=None):
     file_info = f"FILE NAME: {item.get('source', 'Unknown')}"
     messages = [
         {"role": "system", "content": _ANALYZE_SYSTEM},
@@ -742,25 +737,29 @@ def analyze_passage(config, query, item, on_delta=None):
                 chunks.append(d)
                 on_delta(d)
 
-            raw_text = chat_stream(config, messages, 300, _cap)
+            raw_text = chat_stream(config, messages, 300, _cap, model=model)
         else:
-            raw_text = chat(config, messages, 300)
+            raw_text = chat(config, messages, 300, model=model)
         summary, tag = _parse_analysis(raw_text)
         return summary, tag, (raw_text or "").strip()
     except Exception as exc:
         streamed = (raw_text or "").strip()
         fallback = streamed or item.get("text", "")[:600]
-        summary, tag = _parse_analysis(fallback) if streamed else (f"(analysis call failed: {exc}) passage begins: {item.get('text', '')[:300]}", "RELATED")
+        if streamed:
+            summary, tag = _parse_analysis(fallback)
+        else:
+            summary = f"(analysis call failed: {exc}) passage begins: {item.get('text', '')[:300]}"
+            tag = "RELATED"
         return summary, tag, streamed
 
 
 # --------------------------------------------------------------------------- #
-#  ASSESS  (sufficiency check + gap extraction -> drives corrective retrieval)
+#  ASSESS  (sufficiency + gap)  -- analysis model
 # --------------------------------------------------------------------------- #
 _ASSESS_SYSTEM = (
     "You decide whether a set of document NOTES can answer a QUESTION. Each note is "
     "prefixed by a relevance tag. Reply with JSON ONLY, no prose, no markdown:\n"
-    '{"can_answer": true, "confidence": 0.0, "gap": ""}\n'
+    "{\"can_answer\": true, \"confidence\": 0.0, \"gap\": \"\"}\n"
     "- can_answer = true ONLY if the notes contain the specific requested fact, OR enough "
     "concrete partial facts to give a genuinely useful, specific answer.\n"
     "- can_answer = false if the notes are off-topic, only tangentially related, or missing "
@@ -770,16 +769,14 @@ _ASSESS_SYSTEM = (
 )
 
 
-def assess_sufficiency(config, query, analyzed):
-    """Returns (sufficient: bool, gap: str). Never raises — on error we say 'not yet'
-    so the loop simply keeps gathering until the budget runs out."""
+def assess_sufficiency(config, query, analyzed, model=None):
     notes = "\n".join(f"- [{a['relevance']}] {a['summary']}" for a in analyzed)
     messages = [
         {"role": "system", "content": _ASSESS_SYSTEM},
         {"role": "user", "content": f"QUESTION: {query}\nNOTES:\n{notes}"},
     ]
     try:
-        data = json_reply(config, messages, 160)
+        data = json_reply(config, messages, 160, model=model)
         if not isinstance(data, dict):
             return False, ""
         conf = float(data.get("confidence", 0) or 0)
@@ -803,9 +800,6 @@ def _jaccard(a, b):
 
 
 def collate_for_answer(analyzed):
-    """Order notes by relevance then semantic score, and MERGE near-identical
-    summaries so the answer prompt is not bloated. This is a merge, not a
-    rejection — every card still appears in the UI."""
     ordered = sorted(analyzed, key=lambda a: (REL_RANK.get(a["relevance"], 0), a.get("semantic", 0)), reverse=True)
     merged = []
     for a in ordered:
@@ -822,6 +816,7 @@ def collate_for_answer(analyzed):
 
 def evidence_prompt(query, evidence):
     blocks = []
+    n_contrib = sum(1 for it in evidence if it.get("relevance") in ("ANSWERS", "PARTIAL"))
     for i, item in enumerate(evidence):
         section = item.get("section") or ("Passage " + str((item.get("chunk") or 0) + 1))
         row = f" (Row {item['row']})" if item.get("row") else ""
@@ -830,15 +825,27 @@ def evidence_prompt(query, evidence):
             f"[{i + 1}] File: {item.get('source', 'Unknown')} | {section}{row} | relevance: {rel}\n{item['text']}"
         )
     context = "\n".join(blocks)
+    if n_contrib > 1:
+        synthesis = (
+            f"CRITICAL — MULTI-SOURCE SYNTHESIS: the {n_contrib} notes tagged ANSWERS/PARTIAL are "
+            "COMPLEMENTARY, not redundant. Each note usually carries DIFFERENT details (one has the "
+            "names, another the flight number & fare class, another the price & payment method, etc.). "
+            "You MUST read ALL of them and MERGE their distinct facts into ONE complete answer. Do NOT "
+            "stop after the first note that looks relevant, and do NOT copy any single note verbatim. "
+            "Tag every fact with the exact note number(s) it came from, e.g. [1][2][3]. An answer that "
+            "cites only one note is WRONG here — you are expected to draw from several of them."
+        )
+    else:
+        synthesis = "Cite every fact with the note number it came from, like [1]."
     return (
-        "Answer the question using ONLY the provided NOTES.\n"
-        "Cite every factual claim with source numbers like [1].\n"
-        "Notes tagged ANSWERS/PARTIAL carry the facts to answer with.\n"
-        "Notes tagged RELATED/OFFTOPIC are contrast notes: if the question cannot be fully "
-        "answered, use them to explain precisely what the documents DO contain (entity, "
-        "direction, record type, codes) so the user understands the gap — never give a bare "
-        "'no information' refusal when related notes exist.\n"
-        "If absolutely nothing in the notes relates to the question, say so plainly.\n"
+        "Answer the question using ONLY the provided NOTES, but COMBINE them.\n"
+        + synthesis + "\n"
+        "Notes tagged ANSWERS/PARTIAL carry the facts; RELATED/OFFTOPIC are contrast notes — use them "
+        "to explain precisely what the documents DO contain (entity, direction, codes) instead of a "
+        "bare refusal.\n"
+        "Ignore any trailing '= ...' legend sentence inside a note; it is metadata, not content.\n"
+        "Be complete: include every concrete detail the notes provide that bears on the question "
+        "(names, codes, dates, times, routes, terminals, fare class, price, payment, duration).\n"
         f"NOTES:\n{context}\n"
         f"QUESTION: {query}"
     )
@@ -879,6 +886,10 @@ def faithful(config, query, evidence, answer):
     return bool(re.search(r"\[\d+\]", answer))
 
 
+def _citation_numbers(answer):
+    """Sorted distinct source numbers the answer actually cites, e.g. [1, 3]."""
+    return sorted({int(m) for m in re.findall(r"\[(\d+)\]", answer)})
+
 # --------------------------------------------------------------------------- #
 #  HTTP handler
 # --------------------------------------------------------------------------- #
@@ -905,7 +916,7 @@ class Handler(SimpleHTTPRequestHandler):
     def body(self):
         return json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
 
-    # ---- SSE transport (fixed framing) ----
+    # ---- SSE transport (fixed framing: blank line terminates each frame) ----
     def send_stream_start(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -969,21 +980,30 @@ class Handler(SimpleHTTPRequestHandler):
         self._stage_t = {}
         self._gone = False
         stage = "understand"
+
+        answer_model = (c.get("chat_model") or "").strip()
+        a_model = analysis_model_for(c)        # analysis model (falls back to answer model)
+        have_analysis = bool(a_model)
+
         self.send_stream({"type": "run_start", "evidence_only": evidence_only,
-                          "want_answer": want_answer, "adaptive": adaptive})
+                          "want_answer": want_answer, "adaptive": adaptive,
+                          "analysis_model": a_model, "answer_model": answer_model})
         try:
-            checkpoint = positive(c.get("rerank_count"), 4, 1, 30)        # assess interval
+            checkpoint = positive(c.get("rerank_count"), 4, 1, 30)
             max_checks = positive(c.get("max_candidate_checks"), 24, 4, 200)
             base_candidates = positive(c.get("candidate_count"), 32, 4, 400)
 
-            # ---- 01 understand ----
+            self._log(f"Models — analysis: {a_model or '(none → raw passages)'} · "
+                      f"answer: {answer_model or '(none → evidence only)'}")
+
+            # ---- 01 understand (analysis model) ----
             self._stage("understand", "active")
-            if evidence_only or not adaptive:
+            if not adaptive or not have_analysis:
                 plan = {"rewrite": query, "variants": [query], "retrieve": True, "is_greeting": False}
                 self._log("Adaptive planning off — using the raw question for retrieval.")
             else:
-                self._log("Planning retrieval — asking the model for a rewrite + HyDE variants...")
-                plan = self.pulse_while(lambda: understand_query(c, query))
+                self._log("Planning retrieval — asking the analysis model for a rewrite + HyDE variants...")
+                plan = self.pulse_while(lambda: understand_query(c, query, model=a_model))
             if plan.get("rewrite") and plan["rewrite"] != query:
                 self.send_stream({"type": "query_rewrite", "query": plan["rewrite"]})
                 self._log(f"Query rewritten to: {plan['rewrite']}")
@@ -1022,7 +1042,6 @@ class Handler(SimpleHTTPRequestHandler):
                 q_list = list(dict.fromkeys(base_variants + extra_variants))
                 c2 = dict(c)
                 c2["candidate_count"] = min(400, base_candidates + (wave - 1) * WAVE_EXTRA_CANDIDATES)
-
                 if wave == 1:
                     self._log(f"── retrieval wave 1: {len(q_list)} variant(s), up to {c2['candidate_count']} candidates ──")
                 else:
@@ -1031,25 +1050,20 @@ class Handler(SimpleHTTPRequestHandler):
                                       "gap": last_gap, "candidates": c2["candidate_count"]})
                     self._log(f"── corrective wave {wave}/{MAX_WAVES}: analysed {len(analyzed)}, "
                               f"not yet sufficient — reformulated query from gap: “{last_gap[:80]}” ──", "warn")
-
                 candidates, error = retrieve_fused(q_list, c2, on_variant, rerank_query=query)
                 if error:
                     raise RuntimeError(error)
-
                 new_cands = [x for x in candidates if x["id"] not in seen]
                 if not new_cands:
                     self._log(f"Wave {wave} surfaced no unseen passages — corpus exhausted for these queries.")
                     break
-
                 if not analyze_started:
                     stage = "analyze"
                     self._stage("analyze", "active")
                     analyze_started = True
-
                 self.send_stream({"type": "candidates", "wave": wave, "wave_checks": len(new_cands),
                                   "checked": checks_done, "total": max_checks,
                                   "analyzed": len(analyzed), "checkpoint": checkpoint})
-
                 for item in new_cands:
                     if self._gone or checks_done >= max_checks or sufficient:
                         break
@@ -1065,17 +1079,15 @@ class Handler(SimpleHTTPRequestHandler):
                     }
                     self.send_stream({"type": "verify_start", **meta})
                     t_check = time.time()
-
-                    if evidence_only:
+                    if not have_analysis:
                         summary, tag, raw_text = item["text"][:1600], "RELATED", item["text"][:1600]
                     else:
                         self._log(f"[{checks_done}] analysing {meta['source']} ({meta['section']})...")
                         n = checks_done
                         summary, tag, raw_text = analyze_passage(
                             c, query, item,
-                            lambda d, num=n: self.send_stream({"type": "verify_delta", "number": num, "text": d}))
-
-                    # NO REJECTION: every analysis is kept.
+                            lambda d, num=n: self.send_stream({"type": "verify_delta", "number": num, "text": d}),
+                            model=a_model)
                     entry = {**meta, "summary": summary, "raw": raw_text, "relevance": tag,
                              "text": summary, "path": item.get("path", "")}
                     analyzed.append(entry)
@@ -1087,30 +1099,27 @@ class Handler(SimpleHTTPRequestHandler):
                     )
                     self.send_stream({
                         "type": "verify_done", **meta,
-                        "accepted": True,                 # always kept
+                        "accepted": True,
                         "relevance": tag,
                         "verdict": verdict,
-                        "reason": verdict,                # backwards-compatible field
-                        "fact": summary,                  # never empty -> live text never vanishes
+                        "reason": verdict,
+                        "fact": summary,
                         "parsed": summary,
                         "raw": raw_text,
                         "elapsed": round(time.time() - t_check, 2),
                         "accepted_count": len(analyzed),
                         "target": checkpoint,
                     })
-
-                    # ---- 04 assess at each checkpoint ----
-                    if not evidence_only and len(analyzed) % checkpoint == 0 and checks_done < max_checks:
+                    # ---- 04 assess at each checkpoint (analysis model) ----
+                    if have_analysis and len(analyzed) % checkpoint == 0 and checks_done < max_checks:
                         self._log(f"Assess checkpoint ({len(analyzed)} notes) — can we answer yet?")
-                        sufficient, gap = self.pulse_while(lambda: assess_sufficiency(c, query, analyzed))
+                        sufficient, gap = self.pulse_while(lambda: assess_sufficiency(c, query, analyzed, model=a_model))
                         if sufficient:
                             self._log("Assess: SUFFICIENT — proceeding to answer.", "ok")
-                            self.send_stream({"type": "assess", "sufficient": True, "gap": "",
-                                              "notes": len(analyzed)})
+                            self.send_stream({"type": "assess", "sufficient": True, "gap": "", "notes": len(analyzed)})
                         else:
                             self._log(f"Assess: not yet — gap: “{gap or '(none reported)'}”", "warn")
-                            self.send_stream({"type": "assess", "sufficient": False, "gap": gap,
-                                              "notes": len(analyzed)})
+                            self.send_stream({"type": "assess", "sufficient": False, "gap": gap, "notes": len(analyzed)})
                             if gap and gap.lower() != last_gap.lower():
                                 extra_variants.append(gap)
                                 last_gap = gap
@@ -1125,17 +1134,15 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_stream({"type": "done", "elapsed": round(time.time() - t0, 1)})
                 return
 
-            # final assess if we exited the loop on budget/exhaustion without a checkpoint result
-            if not evidence_only and not sufficient and analyzed:
+            # final assess only matters when we will actually compose an answer
+            if want_answer and have_analysis and not sufficient and analyzed:
                 self._log("Final assess after budget/exhaustion...")
-                sufficient, gap = self.pulse_while(lambda: assess_sufficiency(c, query, analyzed))
+                sufficient, gap = self.pulse_while(lambda: assess_sufficiency(c, query, analyzed, model=a_model))
                 self.send_stream({"type": "assess", "sufficient": sufficient, "gap": gap,
                                   "notes": len(analyzed), "final": True})
 
             analyzed = compress_memory(c, query, analyzed)
             ordered = collate_for_answer(analyzed)
-
-            # UI source list = every analysed card (transparency), with text=summary
             self.send_stream({"type": "sources", "results": [
                 {k: v for k, v in a.items() if k != "embedding"} for a in ordered
             ]})
@@ -1146,41 +1153,68 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_stream({"type": "done", "elapsed": round(time.time() - t0, 1)})
                 return
 
-            # ---- 05 answer ----
+            # ---- 05 answer (answer model) ----
             stage = "answer"
             self._stage("answer", "active")
             limited = context_limited_evidence(c, ordered)
             used_chars = sum(len(x["text"]) for x in limited)
-            self._log(f"Composing cited answer from {len(limited)} note(s), {used_chars} chars "
-                      f"(sufficient={sufficient})...")
+            self._log(f"Composing cited answer with {answer_model} from {len(limited)} note(s), "
+                      f"{used_chars} chars (sufficient={sufficient})...")
             prompt = evidence_prompt(query, limited)
             tokens = positive(c["answer_tokens"], 900, 64, 8000)
-
             if sufficient:
-                sys_msg = "You are a precise evidence-only document assistant. Answer from the ANSWERS/PARTIAL notes and cite with [n]."
+                sys_msg = (
+                    "You are a precise evidence-only document assistant. The NOTES are complementary "
+                    "fragments of the answer — your job is to MERGE them. Pull the distinct details from "
+                    "EVERY ANSWERS/PARTIAL note that bears on the question (names, codes, dates, times, "
+                    "routes, terminals, fare class, price, payment, duration) and weave them into one "
+                    "complete answer, tagging each fact with its [n]. A single-note answer is incomplete "
+                    "whenever another note adds a relevant detail. Never invent facts not in the notes."
+                )
             else:
                 sys_msg = (
-                    "You are a precise evidence-only document assistant. The notes do NOT fully "
-                    "answer the question. Give the most useful partial answer you can from the "
-                    "ANSWERS/PARTIAL notes, then use the RELATED/OFFTOPIC contrast notes to state "
-                    "exactly what the documents DO contain (entity, direction, codes) and which "
-                    "requested detail is absent. Cite everything with [n]. Never output a bare "
-                    "'no information' refusal while related notes exist."
+                    "You are a precise evidence-only document assistant. The NOTES are complementary "
+                    "fragments and do NOT fully answer the question. First MERGE every distinct detail "
+                    "the ANSWERS/PARTIAL notes provide into a partial answer, tagging each fact with its "
+                    "[n] (a one-note answer is incomplete if other notes add details). Then use the "
+                    "RELATED/OFFTOPIC contrast notes to state exactly what the documents DO contain "
+                    "(entity, direction, codes) and which requested detail is absent. Never output a "
+                    "bare 'no information' refusal while related notes exist."
                 )
             messages = [
                 {"role": "system", "content": sys_msg},
                 {"role": "user", "content": prompt},
             ]
-            answer = chat_stream(c, messages, tokens, lambda d: self.send_stream({"type": "delta", "text": d}))
-
-            if not faithful(c, query, limited, answer):
-                self._log("No [n] citations detected — requesting a cited regeneration.", "warn")
+            answer = chat_stream(c, messages, tokens,
+                                 lambda d: self.send_stream({"type": "delta", "text": d}),
+                                 model=answer_model)
+            cited = _citation_numbers(answer)
+            contrib = [i + 1 for i, it in enumerate(limited)
+                       if it.get("relevance") in ("ANSWERS", "PARTIAL")]
+            need_combine = len(contrib) > 1 and len(set(cited) & set(contrib)) < 2
+            if not faithful(c, query, limited, answer) or need_combine:
+                if need_combine:
+                    self._log(
+                        f"Answer anchored to a single source (cited {sorted(set(cited) & set(contrib)) or cited}); "
+                        f"{len(contrib)} notes contribute ({contrib}) — regenerating to COMBINE them.",
+                        "warn",
+                    )
+                else:
+                    self._log("No [n] citations detected — requesting a cited regeneration.", "warn")
                 self.send_stream({"type": "answer_reset"})
                 regen = [
-                    {"role": "system", "content": "Regenerate using ONLY the notes. Cite every claim with [n]. Use contrast notes to explain any gap instead of refusing."},
+                    {"role": "system", "content": (
+                        "Your previous answer was REJECTED because it did not combine the sources. "
+                        f"{len(contrib)} notes are tagged ANSWERS/PARTIAL — note numbers {contrib}. You "
+                        "MUST merge the DISTINCT facts from at least two of these notes into one complete "
+                        "answer, tagging each fact with the note it came from (e.g. [1][2][3]). Do not copy "
+                        "a single note and do not stop at the first relevant note. Use RELATED/OFFTOPIC "
+                        "notes only to explain gaps. Cite every claim with [n]."
+                    )},
                     {"role": "user", "content": prompt},
                 ]
-                answer = chat_stream(c, regen, tokens, lambda d: self.send_stream({"type": "delta", "text": d}))
+                answer = chat_stream(c, regen, tokens,
+                                     lambda d: self.send_stream({"type": "delta", "text": d}))
 
             approx_tokens = max(1, len(answer) // 4)
             self.send_stream({"type": "answer_meta", "tokens": approx_tokens, "chars": len(answer),
@@ -1188,14 +1222,13 @@ class Handler(SimpleHTTPRequestHandler):
             self._stage("answer", "done")
             self._log(f"Answer complete — ~{approx_tokens} tokens, {round(time.time() - t0, 1)}s total.", "ok")
             self.send_stream({"type": "done", "elapsed": round(time.time() - t0, 1)})
-
         except Exception as e:
             self._log(f"{stage.upper()} failed — {e}", "error")
             self._stage(stage, "error")
             self.send_stream({"type": "error", "error": str(e), "stage": stage})
             self.send_stream({"type": "done", "elapsed": round(time.time() - t0, 1), "aborted": True})
 
-    # ---- ingest (unchanged behaviour, streamed) ----
+    # ---- ingest (streamed) ----
     def _ingest_stream(self, c, body):
         folder = Path(c["source_folder"])
         allowed = {x.strip().lower() for x in c["include_extensions"].split(",") if x.strip()}
@@ -1208,18 +1241,15 @@ class Handler(SimpleHTTPRequestHandler):
             if mode != "full" and existing.get("chunk_params") != params:
                 mode = "full"
                 self._log("Chunking parameters changed — forcing a full rebuild.", "warn")
-
             self._log(f"Ingest started ({mode}) — scanning {folder} ...")
             self.send_stream({
                 "type": "progress", "phase": "ingest", "percent": 2,
                 "text": ("Full rebuild requested. Scanning document folder..." if mode == "full"
                          else "Scanning for new or changed documents (saved vectors are reused)..."),
             })
-
             files = [p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in allowed and DATA not in p.parents]
             current_sigs = {str(p): file_signature(p) for p in files}
             reused, changed = [], files
-
             if mode != "full":
                 old_sigs = existing.get("files", {})
                 reused = [
@@ -1243,7 +1273,6 @@ class Handler(SimpleHTTPRequestHandler):
                     "text": f"Found {len(files)} supported document(s). Creating passages...",
                 })
                 self._log(f"{len(files)} supported document(s) found.")
-
             new_chunks, errors = [], []
             for number, p in enumerate(changed, 1):
                 if self._gone:
@@ -1260,12 +1289,10 @@ class Handler(SimpleHTTPRequestHandler):
                     "percent": 8 + round(20 * number / max(len(changed), 1)),
                     "text": f"Processed {number} of {len(changed)} document(s): {p.name}",
                 })
-
             if not new_chunks and not reused:
                 self._log("No supported text found in the selected folder.", "error")
                 self.send_stream({"type": "error", "error": "No supported text was found in the selected folder."})
                 return
-
             embedding_model = resolved(c, "embedding")
             if new_chunks:
                 self.send_stream({
@@ -1289,15 +1316,15 @@ class Handler(SimpleHTTPRequestHandler):
                     })
             else:
                 self._log("No new passages to embed — reusing all saved vectors.", "ok")
-                self.send_stream({"type": "progress", "phase": "ingest", "percent": 80, "text": "No new passages to embed. Reusing all saved vectors..."})
-
+                self.send_stream({"type": "progress", "phase": "ingest", "percent": 80,
+                                  "text": "No new passages to embed. Reusing all saved vectors..."})
             docs = [d for d in (reused + new_chunks) if d.get("path") in current_sigs]
             if not docs:
                 self.send_stream({"type": "error", "error": "No supported text was found in the selected folder."})
                 return
-
             self._log(f"Building exact-keyword index over {len(docs)} passage(s)...")
-            self.send_stream({"type": "progress", "phase": "ingest", "percent": 87, "text": f"Building exact-keyword index over {len(docs)} passage(s)..."})
+            self.send_stream({"type": "progress", "phase": "ingest", "percent": 87,
+                              "text": f"Building exact-keyword index over {len(docs)} passage(s)..."})
             lengths, document_frequency, postings = [], Counter(), {}
             for item_index, item in enumerate(docs):
                 counts = Counter(words(item["text"]))
@@ -1311,8 +1338,8 @@ class Handler(SimpleHTTPRequestHandler):
                 "document_frequency": document_frequency,
                 "postings": postings,
             }
-
-            self.send_stream({"type": "progress", "phase": "ingest", "percent": 96, "text": "Saving portable index to data/index.json..."})
+            self.send_stream({"type": "progress", "phase": "ingest", "percent": 96,
+                              "text": "Saving portable index to data/index.json..."})
             with lock:
                 save_json(INDEX_FILE, {
                     "version": 2, "chunks": docs, "lexical": lexical,
@@ -1336,7 +1363,6 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/api/settings":
             return self.send_json(settings())
-
         if self.path == "/api/options":
             base = ROOT.parent.parent
             folders = [ROOT.parent, base]
@@ -1348,11 +1374,9 @@ class Handler(SimpleHTTPRequestHandler):
                 "folders": [{"value": str(p), "label": "Ingest folder (recommended)" if p == ROOT.parent else p.name}
                             for p in dict.fromkeys(folders)]
             })
-
         if self.path == "/api/status":
             idx = load(INDEX_FILE, {"chunks": [], "updated": None})
             return self.send_json({"chunks": len(idx["chunks"]), "updated": idx.get("updated"), "hardware": HARDWARE["label"]})
-
         if self.path == "/api/models":
             state, detail = "connected", ""
             try:
@@ -1369,7 +1393,7 @@ class Handler(SimpleHTTPRequestHandler):
                               for item in api(settings(), "/models", timeout=2).get("data", [])]
                 except Exception:
                     models, state = [], "unavailable"
-                    detail = (f"LM Studio is not reachable at {openai_base(settings())}. Start its local server, then refresh models.")
+            detail = (f"LM Studio is not reachable at {openai_base(settings())}. Start its local server, then refresh models.")
             return self.send_json({
                 "data": [
                     {"id": LOCAL_EMBEDDING_MODEL, "label": LOCAL_EMBEDDING_MODEL, "type": "bundled", "loaded": True},
@@ -1378,7 +1402,6 @@ class Handler(SimpleHTTPRequestHandler):
                 "state": state,
                 "detail": detail if state != "connected" else "",
             })
-
         if self.path == "/":
             self.path = "/index.html"
         return super().do_GET()
@@ -1386,7 +1409,6 @@ class Handler(SimpleHTTPRequestHandler):
     def do_POST(self):
         try:
             body = self.body()
-
             if self.path == "/api/settings":
                 current = settings()
                 allowed = set(DEFAULTS)
@@ -1398,14 +1420,51 @@ class Handler(SimpleHTTPRequestHandler):
                         updated[key] = str(updated[key]).lower() == "true"
                 save_json(SETTINGS_FILE, {**current, **updated})
                 return self.send_json(settings())
-
             if self.path == "/api/load-model":
-                key = body.get("model", "")
+                key = (body.get("model") or "").strip()
                 if not key:
-                    return self.send_json({"error": "Choose an LM Studio answer model."}, 400)
-                result = lmstudio_api(settings(), "/api/v1/models/load", {"model": key}, timeout=180)
-                return self.send_json(result)
-
+                    return self.send_json({"success": False, "loaded": False,
+                                           "error": "Choose a model to load."}, 400)
+                c = settings()
+                try:
+                    models = _lm_models(c)
+                    if not models:
+                        return self.send_json({"success": False, "loaded": False, "model": key,
+                                               "error": "LM Studio returned no models. Is the local server running?"})
+                    cands, already = _candidate_ids(models, key)
+                    if already:
+                        return self.send_json({"success": True, "loaded": True, "model": key,
+                                               "note": "already loaded"})
+                    before = _loaded_set(models)
+                    last_err = ""
+                    for ident in cands:
+                        try:
+                            lmstudio_api(c, "/api/v1/models/load", {"model": ident}, timeout=240)
+                        except urllib.error.HTTPError as he:
+                            try:
+                                last_err = f"HTTP {he.code}: {he.read().decode('utf-8', 'replace')[:240]}"
+                            except Exception:
+                                last_err = f"HTTP {he.code}"
+                            continue
+                        except Exception as ex:
+                            last_err = str(ex)
+                            continue
+                        for _ in range(24):
+                            time.sleep(0.5)
+                            now_models = _lm_models(c)
+                            _, loaded = _candidate_ids(now_models, key)
+                            if loaded:
+                                return self.send_json({"success": True, "loaded": True, "model": key})
+                            after = _loaded_set(now_models)
+                            cands2, _ = _candidate_ids(now_models, key)
+                            if (after - before) and (set(cands2) & after):
+                                return self.send_json({"success": True, "loaded": True, "model": key})
+                    return self.send_json({
+                        "success": False, "loaded": False, "model": key,
+                        "error": last_err or "LM Studio accepted the request but the model did not appear as loaded.",
+                    })
+                except Exception as ex:
+                    return self.send_json({"success": False, "loaded": False, "model": key, "error": str(ex)})
             if self.path == "/api/ingest":
                 c = settings()
                 folder = Path(c["source_folder"])
@@ -1444,11 +1503,9 @@ class Handler(SimpleHTTPRequestHandler):
                                            "updated": time.strftime("%Y-%m-%d %H:%M:%S")})
                 return self.send_json({"documents": len({x["path"] for x in docs}), "chunks": len(docs),
                                        "errors": errors, "performance": HARDWARE["label"]})
-
             if self.path == "/api/ingest-stream":
                 self._ingest_stream(settings(), body)
                 return
-
             if self.path == "/api/search":
                 c = settings()
                 query = body.get("query", "").strip()
@@ -1462,9 +1519,8 @@ class Handler(SimpleHTTPRequestHandler):
                     answer = chat(c, [
                         {"role": "system", "content": "You are a precise document question-answering assistant. Follow the evidence and citation requirements exactly."},
                         {"role": "user", "content": evidence_prompt(query, context_limited_evidence(c, results))},
-                    ])
+                    ], model=c["chat_model"])
                 return self.send_json({"answer": answer, "results": [public(r) for r in results]})
-
             if self.path == "/api/answer-stream":
                 c = settings()
                 query = text(body.get("query"))
@@ -1478,7 +1534,6 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_stream_start()
                 self._answer_stream(c, query, want_answer, evidence_only, bool(body.get("adaptive", True)))
                 return
-
             if self.path == "/api/index/clear":
                 for candidate in (INDEX_FILE, INDEX_FILE.with_suffix(".tmp")):
                     try:
@@ -1488,7 +1543,6 @@ class Handler(SimpleHTTPRequestHandler):
                     except OSError:
                         pass
                 return self.send_json({"cleared": True})
-
             self.send_json({"error": "Not found"}, 404)
         except Exception as e:
             try:
