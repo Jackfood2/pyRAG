@@ -1,8 +1,3 @@
-Here is a detailed, well-structured, and clear `README.md` file tailored for your GitHub repository.
-
----
-
-```markdown
 # Offline RAG — Local Document Intelligence
 
 > **100% Private, Portable, and Local Retrieval-Augmented Generation Workstation**  
