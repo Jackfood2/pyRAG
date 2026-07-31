@@ -52,6 +52,14 @@ http://127.0.0.1:8765
 2. Watch the **Pipeline** panel show the search progress in real time.
 3. Read the generated answer in the **Answer** box and hover over citation numbers `[1]` to see the exact source text highlighted in the **Evidence** box below.
 
+### Running Without LLM / LM Studio (Retrieval-Only & Evidence Mode)
+
+Offline RAG is fully functional even if LM Studio is not running or no LLM is loaded. When no LLM is configured—or when "Evidence only" mode is toggled—the application operates as a high-speed local document search engine and evidence reader.
+
+---
+
+If you do not have LM Studio open, Offline RAG still works. It uses its built-in local engines to search your documents and display the exact matching text passages, page numbers, and file excerpts directly. You do not get a written AI summary, but search remains fast, intelligent, and accurate.
+
 ---
 
 # PART 2: TECHNICAL MANUAL
@@ -81,6 +89,7 @@ Offline RAG uses a multi-tier local architecture. The backend is written in Pyth
 | Local Embedding Server|   |   LM Studio Server   |   |  Local Reranker Server  |
 |  (llama-server.exe)   |   |  http://127.0.0.1:1234|   |   (llama-server.exe)    |
 +-----------------------+   +---------------------+   +-------------------------+
+
 ```
 
 ### Server Network Map
@@ -88,6 +97,36 @@ Offline RAG uses a multi-tier local architecture. The backend is written in Pyth
 * **Port 8787**: Embedded `llama-server` instance handling embeddings.
 * **Port 8788**: Embedded `llama-server` instance handling cross-encoder reranking.
 * **Port 1234**: External LM Studio endpoint (`/v1/chat/completions`).
+
+#### Technical Behavior and Pipeline Adjustments
+
+When `chat_model` is blank, LM Studio is unreachable, or "Evidence only" is enabled in the UI, `app.py` automatically routes execution through a zero-LLM fast path:
+
+1. **01 Understand Stage**: Skipped. Query rewriting and HyDE generation are bypassed. Search uses the exact user prompt.
+2. **02 Retrieve Stage**: Active. Runs full hybrid retrieval (BM25 keyword search + local GGUF embedding vector similarity via `llama-server` on port 8787) followed by cross-encoder reranking (`llama-server` on port 8788).
+3. **03 Analyze Stage**: Skipped. The pipeline returns full, unedited source chunks directly to the UI tagged as `RAW`.
+4. **04 Answer Stage**: Skipped. The UI displays the retrieved passages in the **Evidence** panel while keeping the Answer box idle.
+
+* **Latency**: Response times drop from seconds to milliseconds (typically under 100ms total search time).
+* **API Dependencies**: 0 calls to external or local OpenAI/LLM endpoints.
+
+---
+
+#### Feature Availability Matrix
+
+| Feature | With LM Studio / LLM | Without LM Studio / LLM |
+| :--- | :--- | :--- |
+| **BM25 Lexical Keyword Search** | Available | Available |
+| **Local Semantic Vector Search** | Available (llama-server:8787) | Available (llama-server:8787) |
+| **Local BGE Reranking** | Available (llama-server:8788) | Available (llama-server:8788) |
+| **Full Chunk & Document Viewer** | Available | Available |
+| **PST & Document Ingestion** | Available | Available |
+| **LLM Query Rewriting & HyDE** | Available | Skipped |
+| **LLM Passage Summarization** | Available | Skipped (Displays Raw Text) |
+| **Iterative Multi-Wave Search** | Available | Single-Pass Search |
+| **AI Answer Synthesis & Citations**| Available | Skipped (Evidence Only) |
+
+---
 
 ---
 
@@ -124,7 +163,7 @@ OfflineRAG/
 ├── README.md                        # Documentation
 ├── app.py                           # Application logic and HTTP server
 └── index.html                       # Frontend user interface
-```
+
 
 ---
 
