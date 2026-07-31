@@ -220,6 +220,14 @@ button:disabled{opacity:.4;cursor:not-allowed}
   border:1px solid var(--border);border-radius:11px;background:var(--panel2);overflow:hidden;
   transition:.2s;animation:rise .35s ease both}
 .ev-card.streaming{min-height:96px}
+.ev-card.collapsed{min-height:0}
+.ev-card.collapsed .ev-inner{padding-bottom:10px}
+.ev-card.collapsed .ev-head{margin-bottom:0}
+.ev-card.collapsed .ev-body,.ev-card.collapsed .ev-foot{display:none}
+.ev-src{cursor:pointer}
+.ev-src:focus-visible{outline:2px solid var(--teal-d);outline-offset:3px;border-radius:3px}
+.ev-toggle{margin-left:auto;color:var(--dim);font-size:12px;transition:transform .18s}
+.ev-card:not(.collapsed) .ev-toggle{transform:rotate(90deg);color:var(--teal)}
 .ev-card:hover{border-color:var(--border2);transform:translateY(-1px)}
 .ev-card.spotlight{border-color:var(--teal);box-shadow:0 0 0 1px var(--teal-d),0 0 26px rgba(67,227,177,.18)}
 @keyframes rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
@@ -531,6 +539,7 @@ input[type=range]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;bac
         <label>Semantic ↔ keyword weighting</label>
         <input type="range" id="semWeight" min="0" max="100" value="72">
         <div class="sem-read"><span class="kw"><b id="kwVal">28</b> keyword · pins codes &amp; numbers</span><span><b id="semVal">72</b> semantic</span></div>
+        <span class="hint">Saved automatically and applied to the next enquiry — no restart or re-index required. Title/subject hits receive extra weight; one- or two-keyword searches receive the strongest title boost.</span>
       </div>
     </div>
 
@@ -696,13 +705,14 @@ function spotlight(n,on,scroll){
   const idx=(+n)-1; const num=sourcesOrder[idx]; if(num==null) return;
   const card=evidenceEls.get(num); if(!card) return;
   card.classList.toggle("spotlight",on);
+  if(on&&scroll){card.classList.remove("collapsed");if(card._refs&&card._refs.src)card._refs.src.setAttribute("aria-expanded","true");}
   if(on&&scroll) scrollEvidenceToCard(card,true);
   else if(on) scrollEvidenceToCard(card,false);
 }
 
 function setViewerTab(mode){viewerChunkTab.classList.toggle("open",mode==="chunk");viewerDocumentTab.classList.toggle("open",mode==="document");}
 function viewerMeta(e,documentMode=false){const bits=[];if(e.row)bits.push("Row "+e.row);bits.push("Evidence #"+e.number);if(e.path)bits.push(e.path);if(documentMode&&viewerTotal)bits.push(viewerTotal.toLocaleString()+" extracted characters");else bits.push((e.full_text||"").length+" chunk characters");chunkMeta.textContent=bits.join(" · ");}
-function openChunkViewer(e){viewerEvidence=e;viewerOffset=0;viewerTotal=0;viewerLoading=false;chunkTitle.textContent=(e.source||"Source")+" — "+(e.section||("Passage "+e.number));viewerMeta(e,false);chunkText.textContent=e.full_text||"No source text was supplied.";setViewerTab("chunk");viewerMore.hidden=true;$("viewerOpenOriginal").disabled=!e.path;$("viewerShowFolder").disabled=!e.path;viewerDocumentTab.disabled=!e.path;chunkModal.classList.add("open");chunkModal.setAttribute("aria-hidden","false");document.body.style.overflow="hidden";$("chunkClose").focus();}
+function openChunkViewer(e){viewerEvidence=e;viewerOffset=0;viewerTotal=0;viewerLoading=false;chunkTitle.textContent=(e.title||e.source||"Source")+" — "+(e.section||("Passage "+e.number));viewerMeta(e,false);chunkText.textContent=e.full_text||"No source text was supplied.";setViewerTab("chunk");viewerMore.hidden=true;$("viewerOpenOriginal").disabled=!e.path;$("viewerShowFolder").disabled=!e.path;viewerDocumentTab.disabled=!e.path;chunkModal.classList.add("open");chunkModal.setAttribute("aria-hidden","false");document.body.style.overflow="hidden";$("chunkClose").focus();}
 async function openOriginal(path,reveal=false){if(!path){toast("Original file path is unavailable. Rebuild the index once.","err");return;}try{const r=await fetch("/api/open-path?path="+encodeURIComponent(path)+"&reveal="+(reveal?"1":"0"));const d=await r.json().catch(()=>({}));if(!r.ok||!d.success)throw new Error(d.error||("HTTP "+r.status));toast(reveal?"Opened containing folder.":"Opened original document.","ok");}catch(err){toast("Could not open original: "+err.message,"err");addLog("Open original failed: "+err.message,"error");}}
 async function loadDocumentText(reset=false){if(!viewerEvidence||!viewerEvidence.path||viewerLoading)return;viewerLoading=true;setViewerTab("document");if(reset){viewerOffset=0;viewerTotal=0;chunkText.textContent="Extracting whole document text…";viewerMore.hidden=true;}try{const url="/api/document-text?path="+encodeURIComponent(viewerEvidence.path)+"&document_id="+encodeURIComponent(viewerEvidence.document_id||"")+"&offset="+viewerOffset;const r=await fetch(url);let d={};try{d=await r.json();}catch(_){throw new Error("Backend returned an invalid response. Restart app.py and refresh with Ctrl+F5.");}if(!r.ok||!d.success)throw new Error(d.error||("HTTP "+r.status));if(reset)chunkText.textContent=d.text||"No extractable text was found.";else chunkText.textContent+=(d.text?"\n\n"+d.text:"");viewerOffset=d.next_offset==null?d.total_chars:d.next_offset;viewerTotal=d.total_chars||0;
     if(d.using_fallback){viewerFallback.hidden=false;$("viewerFallbackNote").textContent="Showing retained extracted-text snapshot from "+(d.snapshot_created||"ingestion")+" because the original document no longer exists at the indexed path.";if(reset)toast("Original document not found — using retained extracted-text snapshot.","info");}
@@ -737,14 +747,20 @@ function buildCard(meta,isStreaming){
   const tag=el("span",{class:"ev-tag"+(isStreaming?"":" t-related"),text:isStreaming?"ANALYSING":"RELATED"});
   const bar=el("span",{class:"ev-meter"}); const fill=el("span",{class:"ev-meter-fill"}); bar.appendChild(fill);
   const pct=el("span",{class:"ev-pct",text:isStreaming?"":Math.round((meta.semantic||0)*100)+"%"});
-  head.append(icon, el("span",{class:"ev-src",text:meta.source||"source"}), el("span",{class:"ev-ext",text:ext}), tag, bar, pct);
+  const displayTitle=meta.title||meta.source||"source";
+  const src=el("span",{class:"ev-src",text:displayTitle,role:"button",tabindex:"0","aria-expanded":"true",title:(meta.source?meta.source+" — ":"")+"collapse or expand this evidence"});
+  const toggle=el("span",{class:"ev-toggle",text:"›","aria-hidden":"true"});
+  head.append(icon, src, el("span",{class:"ev-ext",text:ext}), tag, bar, pct, toggle);
   inner.appendChild(head);
   const body=el("div",{class:"ev-body"});
   if(isStreaming){ body.appendChild(el("span",{class:"ev-stream"})); body.appendChild(el("span",{class:"caret"})); }
   inner.appendChild(body);
   const foot=el("div",{class:"ev-foot"}); inner.appendChild(foot);
   card.appendChild(inner);
-  card._refs={icon,tag,fill,pct,body,foot};
+  card._refs={icon,tag,fill,pct,body,foot,src,toggle};
+  const toggleCard=()=>{const collapsed=card.classList.toggle("collapsed");src.setAttribute("aria-expanded",String(!collapsed));};
+  src.addEventListener("click",toggleCard);
+  src.addEventListener("keydown",event=>{if(event.key==="Enter"||event.key===" "){event.preventDefault();toggleCard();}});
   return card;
 }
 function scrollEvidenceToCard(card,center=false){
@@ -768,7 +784,8 @@ function doneCard(e){
   if(!card){ card=buildCard(e,false); evidenceEls.set(e.number,card); evList.appendChild(card); }
   const r=card._refs; const rel=(e.raw_evidence?"raw":(e.relevance||"RELATED").toLowerCase());
   card._fullText=e.full_text||""; card.dataset.rawEvidence=e.raw_evidence?"1":"0";
-  card.classList.remove("streaming"); card.classList.add("rel-"+rel);
+  card.classList.remove("streaming"); card.classList.add("rel-"+rel,"collapsed");
+  r.src.setAttribute("aria-expanded","false");
   r.icon.textContent="✓";
   r.tag.textContent=e.raw_evidence?"RAW":e.relevance; r.tag.className="ev-tag t-"+rel;
   const pc=Math.round((e.semantic||0)*100);
@@ -1151,6 +1168,7 @@ async function saveSettingsNow(){
     // Do not call fillSettings here: rewriting active controls while the user is
     // typing causes cursor jumps. The server response is already authoritative.
     setSaveState("saved","Auto-saved");
+    if(data.retrieval_balance_applies==="next_query") addLog("Retrieval balance saved — applies to the next enquiry; no restart needed.","ok");
     refreshModels(); fetchLocalModels();
   }catch(e){
     if(seq!==autoSaveSeq) return;

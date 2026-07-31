@@ -1341,6 +1341,17 @@ def _loaded_set(models):
 # --------------------------------------------------------------------------- #
 #  retrieval
 # --------------------------------------------------------------------------- #
+def searchable_title(chunk):
+    """Return an email/document title, preferring indexed Subject metadata."""
+    raw = str(chunk.get("text", ""))[:12000]
+    # PST conversation exports contain THREAD SUBJECT; standalone messages use SUBJECT.
+    for label in ("THREAD SUBJECT", "SUBJECT"):
+        match = re.search(rf"(?im)^\s*{label}\s*:\s*(.+?)\s*$", raw)
+        if match and text(match.group(1)):
+            return text(match.group(1))[:500]
+    return Path(str(chunk.get("source", "") or "Untitled")).stem
+
+
 def retrieve(query, config, excluded=None, rerank=True):
     # DYNAMIC RAM CACHING: loads instantly using array buffer
     index = get_cached_index()
@@ -1409,14 +1420,49 @@ def retrieve(query, config, excluded=None, rerank=True):
         for s, i in scores[:top_k]:
             semantic_scores[i] = s
 
-    lexical_rank = sorted(range(len(corpus)), key=lambda i: lexical[i], reverse=True)[:top_k]
-    
+    # Exclude zero-match passages from lexical rank. Previously they still got
+    # keyword rank positions, which diluted short exact searches such as "APAC".
+    lexical_rank = [
+        i for i in sorted(range(len(corpus)), key=lambda i: lexical[i], reverse=True)
+        if lexical[i] > 0
+    ][:top_k]
+
+    semantic_weight = max(0.0, float(config.get("semantic_weight", 0.72)))
+    keyword_weight = max(0.0, float(config.get("keyword_weight", 0.28)))
     fused = Counter()
     for rank, idx in enumerate(semantic_rank, 1):
-        fused[idx] += float(config.get("semantic_weight", 0.72)) / (60 + rank)
+        fused[idx] += semantic_weight / (60 + rank)
     for rank, idx in enumerate(lexical_rank, 1):
-        fused[idx] += float(config.get("keyword_weight", 0.28)) / (60 + rank)
-        
+        fused[idx] += keyword_weight / (60 + rank)
+
+    # Literal coverage boost for acronyms, codes, names and exact phrases.
+    # A title/subject hit is deliberately stronger than a body hit, especially
+    # for one- or two-keyword enquiries where the title is highly discriminative.
+    query_terms = set(words(query))
+    if query_terms and lexical_rank and keyword_weight > 0:
+        max_lexical = max(lexical[i] for i in lexical_rank) or 1.0
+        exact_phrase = text(query).lower()
+        short_query_multiplier = 2.4 if len(query_terms) == 1 else (1.7 if len(query_terms) == 2 else 1.0)
+        for idx in lexical_rank:
+            title = searchable_title(corpus[idx])
+            title_text = title.lower()
+            body_text = str(corpus[idx].get("text", "")).lower()
+            source_text = str(corpus[idx].get("source", "")).lower()
+            searchable = body_text + " " + source_text
+            title_terms = set(words(title_text))
+            body_terms = set(words(searchable))
+            body_coverage = len(query_terms & body_terms) / len(query_terms)
+            title_coverage = len(query_terms & title_terms) / len(query_terms)
+            lexical_strength = lexical[idx] / max_lexical
+            body_phrase = 1.0 if exact_phrase and exact_phrase in searchable else 0.0
+            title_phrase = 1.0 if exact_phrase and exact_phrase in title_text else 0.0
+            fused[idx] += keyword_weight * (
+                0.012 * body_coverage +
+                0.008 * lexical_strength +
+                0.008 * body_phrase +
+                short_query_multiplier * (0.055 * title_coverage + 0.035 * title_phrase)
+            )
+
     excluded = excluded or set()
     result = []
     for idx in sorted(fused, key=fused.get, reverse=True):
@@ -1426,6 +1472,8 @@ def retrieve(query, config, excluded=None, rerank=True):
         item = {k: v for k, v in chunk.items() if k != "_vec_buf"}
         item["_score"] = fused[idx]
         item["_semantic_score"] = semantic_scores.get(idx, 0)
+        item["_keyword_score"] = lexical[idx]
+        item["title"] = searchable_title(chunk)
         result.append(item)
         if len(result) >= candidates_needed:
             break
@@ -2244,6 +2292,7 @@ class Handler(SimpleHTTPRequestHandler):
                     meta = {
                         "number": number, "total": len(limited),
                         "source": item.get("source", ""),
+                        "title": item.get("title") or searchable_title(item),
                         "section": item.get("section") or f"Passage {(item.get('chunk') or 0) + 1}",
                         "row": item.get("row"), "path": item.get("path", ""),
                         "document_id": item.get("document_id", ""),
@@ -2358,6 +2407,7 @@ class Handler(SimpleHTTPRequestHandler):
                     meta = {
                         "number": checks_done, "total": max_checks,
                         "source": item.get("source", ""),
+                        "title": item.get("title") or searchable_title(item),
                         "section": item.get("section") or f"Passage {(item.get('chunk') or 0) + 1}",
                         "row": item.get("row"), "path": item.get("path", ""),
                         "document_id": item.get("document_id", ""),
@@ -3145,6 +3195,8 @@ class Handler(SimpleHTTPRequestHandler):
                     saved = settings()
                 if gpu_changed:   # apply GPU offload change without a full app restart
                     threading.Thread(target=lambda: _start_local_servers(settings(), wait=True), daemon=True).start()
+                # Retrieval weights are loaded for every enquiry; no restart or re-index.
+                saved["retrieval_balance_applies"] = "next_query"
                 return self.send_json(saved)
 
             if self.path == "/api/load-model":
