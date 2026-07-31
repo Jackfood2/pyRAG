@@ -164,7 +164,7 @@ OfflineRAG/
 ├── app.py                           # Application logic and HTTP server
 └── index.html                       # Frontend user interface
 
-
+```
 ---
 
 ## Search Engine and Retrieval Mechanics
