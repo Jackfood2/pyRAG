@@ -3,13 +3,10 @@
 This repository provides a complete, workstation-based Document Intelligence system that searches, analyzes, and answers questions using your private documents. It operates entirely offline without sending any data to the cloud.
 
 The README is divided into two parts:
-1. **Layman's Guide**: A simple, non-technical overview explaining what the application does and how to run it.
-2. **Technical Manual**: A detailed guide covering system architecture, algorithms, configuration, and API endpoints.
+1. A simple, non-technical overview explaining what the application does and how to run it.
+2. A detailed guide covering system architecture, algorithms, configuration, and API endpoints.
 
 ---
-
-# PART 1: LAYMAN'S GUIDE
-
 ## What is Offline RAG?
 Offline RAG is a private search and question-answering assistant for your personal computer. Think of it as a custom search engine combined with an assistant that reads your PDFs, Word documents, Excel spreadsheets, and Outlook emails, and then answers your questions based strictly on that information.
 
