@@ -56,8 +56,6 @@ http://127.0.0.1:8765
 
 Offline RAG is fully functional even if LM Studio is not running or no LLM is loaded. When no LLM is configured—or when "Evidence only" mode is toggled—the application operates as a high-speed local document search engine and evidence reader.
 
----
-
 If you do not have LM Studio open, Offline RAG still works. It uses its built-in local engines to search your documents and display the exact matching text passages, page numbers, and file excerpts directly. You do not get a written AI summary, but search remains fast, intelligent, and accurate.
 
 ---
