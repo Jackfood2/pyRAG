@@ -16,6 +16,17 @@
   --mono:ui-monospace,"JetBrains Mono","SF Mono","Cascadia Code","Roboto Mono",Menlo,Consolas,monospace;
   --serif:"Iowan Old Style","Palatino Linotype",Palatino,"Book Antiqua",Georgia,ui-serif,serif;
   --r:14px;
+  color-scheme:dark;
+}
+:root[data-theme="light"]{
+  --bg:#f4f7f6; --bg2:#ffffff; --panel:#ffffff; --panel2:#f8fbfa;
+  --border:rgba(31,83,70,.16); --border2:rgba(31,83,70,.28);
+  --line2:rgba(31,83,70,.11); --grid:rgba(24,118,92,.07);
+  --ink:#17231f; --ink2:#40544d; --dim:#62766f; --faint:#84948e;
+  --teal:#087f62; --teal-d:#55a992; --teal-dd:#d9f0e9;
+  --amber:#a66b00; --amber-d:#d5ad60;
+  --red:#b43e37; --blue:#176da8; --violet:#6550bd;
+  color-scheme:light;
 }
 *{box-sizing:border-box}
 html,body{margin:0}
@@ -39,6 +50,12 @@ body::before{
   animation:drift 30s ease-in-out infinite alternate;
 }
 @keyframes drift{from{transform:translate3d(-2%,-1%,0) scale(1)}to{transform:translate3d(3%,2%,0) scale(1.08)}}
+:root[data-theme="light"] .ambient{opacity:.72;background:radial-gradient(40% 38% at 18% 12%,rgba(8,127,98,.10),transparent 60%),radial-gradient(42% 40% at 86% 8%,rgba(166,107,0,.08),transparent 60%),radial-gradient(50% 50% at 70% 95%,rgba(23,109,168,.06),transparent 60%)}
+:root[data-theme="light"] .querybar,:root[data-theme="light"] .panel,:root[data-theme="light"] .ev-card{box-shadow:0 5px 22px rgba(25,56,47,.06)}
+:root[data-theme="light"] .pill,:root[data-theme="light"] .gear{background:rgba(255,255,255,.66)}
+:root[data-theme="light"] .btn-ask,:root[data-theme="light"] #saveSettings{color:#241703}
+:root[data-theme="light"] .chunk-modal{background:rgba(28,40,36,.42)}
+:root[data-theme="light"] .scrim{background:rgba(28,40,36,.30)}
 ::selection{background:rgba(67,227,177,.28)}
 ::-webkit-scrollbar{width:9px;height:9px}
 ::-webkit-scrollbar-thumb{background:rgba(120,170,158,.18);border-radius:9px}
@@ -197,9 +214,12 @@ button:disabled{opacity:.4;cursor:not-allowed}
   padding:2px 0 2px 11px;margin-bottom:12px}
 .ev-intro[hidden]{display:none}
 .ev-count{font-size:11px;color:var(--dim);letter-spacing:.06em}
-.ev-list{display:flex;flex-direction:column;gap:12px;max-height:66vh;overflow:auto;padding-right:4px}
-.ev-card{display:grid;grid-template-columns:3px 1fr;border:1px solid var(--border);border-radius:11px;
-  background:var(--panel2);overflow:hidden;transition:.2s;animation:rise .35s ease both}
+.ev-list{display:flex;flex-direction:column;gap:12px;height:min(66vh,760px);min-height:260px;
+  overflow-x:hidden;overflow-y:auto;padding-right:6px;scrollbar-gutter:stable;overscroll-behavior:contain}
+.ev-card{display:grid;grid-template-columns:3px minmax(0,1fr);flex:0 0 auto;min-height:96px;
+  border:1px solid var(--border);border-radius:11px;background:var(--panel2);overflow:hidden;
+  transition:.2s;animation:rise .35s ease both}
+.ev-card.streaming{min-height:96px}
 .ev-card:hover{border-color:var(--border2);transform:translateY(-1px)}
 .ev-card.spotlight{border-color:var(--teal);box-shadow:0 0 0 1px var(--teal-d),0 0 26px rgba(67,227,177,.18)}
 @keyframes rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
@@ -208,13 +228,13 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .ev-card.rel-partial .ev-bar{background:var(--amber)}
 .ev-card.rel-related .ev-bar{background:var(--blue)}
 .ev-card.rel-offtopic .ev-bar{background:var(--faint)}
-.ev-inner{padding:12px 14px}
+.ev-inner{padding:12px 14px;min-width:0}
 .ev-head{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:9px}
 .ev-icon{width:18px;height:18px;border-radius:50%;display:grid;place-items:center;font-size:10px;flex:none;
   border:1px solid var(--border2);color:var(--dim)}
 .ev-card.rel-answers .ev-icon,.ev-card.rel-partial .ev-icon{border-color:var(--teal-d);color:var(--teal);
   background:rgba(67,227,177,.07)}
-.ev-src{font-weight:700;color:var(--ink);font-size:13px}
+.ev-src{font-weight:700;color:var(--ink);font-size:13px;min-width:0;max-width:min(52vw,620px);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .ev-ext{font-size:9.5px;letter-spacing:.1em;color:var(--dim);border:1px solid var(--border);border-radius:5px;padding:1px 6px}
 .ev-tag{font-size:9.5px;letter-spacing:.12em;font-weight:700;border-radius:999px;padding:2px 9px;
   border:1px solid var(--border2);color:var(--dim)}
@@ -222,21 +242,40 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .ev-tag.t-partial{color:var(--amber);border-color:var(--amber-d);background:rgba(220,166,63,.08)}
 .ev-tag.t-related{color:var(--blue);border-color:rgba(98,172,232,.4);background:rgba(98,172,232,.07)}
 .ev-tag.t-offtopic{color:var(--faint)}
+.ev-tag.t-raw{color:var(--ink2);border-color:var(--border2);background:rgba(120,170,158,.07)}
+.ev-card.rel-raw .ev-bar{background:var(--teal-d)}
 .ev-meter{flex:1;min-width:48px;max-width:120px;height:4px;border-radius:99px;background:var(--line2);overflow:hidden}
 .ev-meter-fill{display:block;height:100%;width:0;border-radius:99px;background:var(--teal);transition:width .5s}
 .ev-card.rel-partial .ev-meter-fill{background:var(--amber)}
 .ev-card.rel-related .ev-meter-fill{background:var(--blue)}
 .ev-card.rel-offtopic .ev-meter-fill{background:var(--faint)}
 .ev-pct{font-size:10.5px;color:var(--dim);font-variant-numeric:tabular-nums;min-width:30px;text-align:right}
-.ev-body{font-size:12.5px;line-height:1.62;color:var(--ink2);white-space:pre-wrap}
+.ev-body{font-size:12.5px;line-height:1.62;color:var(--ink2);white-space:pre-wrap;overflow-wrap:anywhere;min-height:2.8em}
 .ev-stream{color:var(--dim)}
 .ev-foot{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:10px;flex-wrap:wrap}
 .ev-verdict{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--faint)}
+.ev-actions{display:flex;gap:7px;margin-left:auto}
 .mo-btn{font-family:var(--mono);font-size:9.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--dim);
   border:1px solid var(--border);background:0;border-radius:6px;padding:4px 9px;cursor:pointer;transition:.2s}
 .mo-btn:hover,.mo-btn.open{color:var(--teal);border-color:var(--teal-d)}
 .mo-raw{margin:10px 0 0;background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:10px;
   font-size:11px;line-height:1.55;color:var(--dim);white-space:pre-wrap;max-height:240px;overflow:auto}
+
+
+/* ---------- full chunk viewer ---------- */
+.chunk-modal{position:fixed;inset:0;z-index:95;display:none;align-items:center;justify-content:center;padding:24px;background:rgba(3,6,6,.78)}
+.chunk-modal.open{display:flex}
+.chunk-dialog{width:min(1040px,96vw);height:min(82vh,900px);display:flex;flex-direction:column;background:var(--bg2);border:1px solid var(--border2);border-radius:14px;box-shadow:0 24px 80px rgba(0,0,0,.65);overflow:hidden}
+.chunk-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 17px;border-bottom:1px solid var(--border)}
+.chunk-title{min-width:0;font-size:12px;font-weight:700;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chunk-close{border:1px solid var(--border);background:var(--panel);color:var(--dim);border-radius:8px;padding:6px 10px;cursor:pointer}
+.chunk-close:hover{color:var(--red);border-color:rgba(227,106,98,.45)}
+.chunk-meta{padding:9px 17px;border-bottom:1px solid var(--border);color:var(--dim);font-size:10.5px}
+.chunk-text{flex:1;overflow:auto;margin:0;padding:18px;font-family:var(--mono);font-size:12.5px;line-height:1.65;color:var(--ink2);white-space:pre-wrap;overflow-wrap:anywhere;user-select:text}
+.viewer-tabs{display:flex;gap:8px;padding:9px 17px;border-bottom:1px solid var(--border)}
+.viewer-more{display:flex;align-items:center;gap:12px;padding:10px 17px;border-top:1px solid var(--border)}
+.viewer-fallback{padding:12px 17px;border-top:1px solid var(--amber-d);background:rgba(220,166,63,.04)}
+.analysis-note{color:var(--amber);font-size:10px;margin-left:auto}
 
 /* ---------- settings ---------- */
 .scrim{position:fixed;inset:0;background:rgba(3,6,6,.55);backdrop-filter:blur(3px);opacity:0;pointer-events:none;
@@ -287,7 +326,11 @@ input[type=range]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;bac
 #cancelSettings{background:0;color:var(--dim)}
 #cancelSettings:hover{color:var(--ink2);border-color:var(--border2)}
 #saveSettings{background:linear-gradient(180deg,#e7b552,#cf9a32);color:#1a1206;border:0;font-weight:700}
-#saveSettings:hover{transform:translateY(-1px)}
+#saveSettings:hover{transform:none}
+#saveSettings{cursor:default;min-width:126px}
+#saveSettings.saving{background:var(--panel);color:var(--amber);border:1px solid var(--amber-d)}
+#saveSettings.saved{background:var(--teal-dd);color:var(--teal);border:1px solid var(--teal-d)}
+#saveSettings.failed{background:rgba(227,106,98,.08);color:var(--red);border:1px solid rgba(227,106,98,.45)}
 
 /* ---------- toast ---------- */
 #toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);z-index:80;display:flex;flex-direction:column;
@@ -299,7 +342,7 @@ input[type=range]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;bac
 .toast.t-ok{border-color:var(--teal-d);color:var(--teal)}
 .toast.t-err{border-color:rgba(227,106,98,.45);color:var(--red)}
 
-@media(max-width:980px){.grid{grid-template-columns:1fr}.brand-tag{display:none}}
+@media(max-width:980px){.grid{grid-template-columns:1fr}.brand-tag{display:none}.ev-list{height:60vh;min-height:320px}}
 </style>
 </head>
 <body>
@@ -316,6 +359,7 @@ input[type=range]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;bac
       <span class="pill" id="pillEmbed"><i class="dot on"></i>EMBED <b>bundled</b></span>
       <span class="pill" id="pillRerank"><i class="dot on"></i>RERANK <b>bundled</b></span>
       <span class="pill" id="pillLm"><i class="dot"></i>LM STUDIO <b>—</b></span>
+      <button class="gear theme-toggle" id="themeToggle" type="button" title="Switch to light mode" aria-label="Switch to light mode" aria-pressed="false">☀</button>
       <button class="gear" id="openSettings" title="Settings">⚙</button>
     </div>
   </header>
@@ -360,12 +404,29 @@ input[type=range]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;bac
         <div class="answer-meta" id="answerMeta"></div>
       </section>
       <section class="panel evidence">
-        <div class="panel-head"><h2>Evidence</h2><span class="ev-count" id="evCount">0 analysed</span></div>
-        <div class="ev-intro" id="evIntro">Every retrieved passage is analysed and kept — tagged by how it relates to your question. Nothing is discarded. Expand “model output” to read exactly what the engine wrote.</div>
+        <div class="panel-head"><h2>Evidence</h2><div style="display:flex;gap:8px;align-items:center"><button class="linkbtn" id="copyEvidence" type="button" disabled>copy all chunks</button><span class="ev-count" id="evCount">0 chunks</span></div></div>
+        <div class="ev-intro" id="evIntro">Retrieved passages appear here. In Evidence only mode, complete raw chunks are shown without LLM summarisation or relevance checking.</div>
         <div class="ev-list" id="evList"></div>
       </section>
     </div>
   </main>
+</div>
+
+
+<div class="chunk-modal" id="chunkModal" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="chunkTitle">
+  <div class="chunk-dialog">
+    <div class="chunk-head"><div class="chunk-title" id="chunkTitle">Evidence viewer</div><div class="ev-actions"><button class="mo-btn" id="viewerOpenOriginal" type="button">Open original</button><button class="mo-btn" id="viewerShowFolder" type="button">Show in folder</button><button class="chunk-close" id="chunkClose" type="button">Close</button></div></div>
+    <div class="chunk-meta" id="chunkMeta"></div>
+    <div class="viewer-tabs"><button class="mo-btn open" id="viewerChunkTab" type="button">Evidence chunk</button><button class="mo-btn" id="viewerDocumentTab" type="button">Whole document text</button></div>
+    <pre class="chunk-text" id="chunkText"></pre>
+    <div class="viewer-more" id="viewerMore" hidden><button class="mini" id="viewerLoadMore" type="button">Load next section</button><span class="hint" id="viewerProgress"></span></div>
+    <div class="viewer-fallback" id="viewerFallback" hidden>
+      <div class="answer-placeholder note" id="viewerFallbackNote">Showing retained extracted-text snapshot because the original document is unavailable.</div>
+      <div class="set-row col"><label>Replacement root folder</label><input type="text" id="viewerRelocateFolder" placeholder="D:\Moved Documents"><span class="hint">Choose the new parent folder. The system checks the expected relative path, filename, size and content fingerprint.</span></div>
+      <div class="idx-actions"><button class="mini primary" id="viewerCheckFolder" type="button">Check folder structure</button></div>
+      <pre id="viewerRelocateReport" class="mo-raw" style="max-height:180px"></pre>
+    </div>
+  </div>
 </div>
 
 <aside class="settings" id="settings" aria-hidden="true">
@@ -424,6 +485,27 @@ input[type=range]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;bac
     </div>
 
     <div class="set-sec">
+      <h3>Outlook PST ingestion</h3>
+      <div class="set-row col"><label>PST file path <span class="hint">— Windows desktop Outlook is required.</span></label><input type="text" id="pstPath" placeholder="C:\Path\Archive.pst"></div>
+      <div class="set-row col"><label>Processing mode</label>
+        <select id="pstProcessingMode">
+          <option value="emails_only">1. Emails first — skip all attachments (fastest)</option>
+          <option value="attachments_only">2. Attachments only — skip email bodies</option>
+          <option value="emails_and_attachments">Emails and attachments together (slowest)</option>
+        </select>
+        <span class="hint">Recommended: run Emails first, index the email TXT files, then run Attachments only separately.</span>
+      </div>
+      <div class="set-row"><label>Latest attachment filename similarity (%)</label><input type="number" id="pstSimilarity" min="50" max="100" value="90"></div>
+      <div class="set-row col"><label>Attachment types</label><input type="text" id="pstAttachmentTypes" value=".msg,.pdf,.xlsx,.xlsm,.docx"></div>
+      <div class="set-row"><label>Enable supported attachment extraction</label><span class="switch on" id="sPstAttachments"></span></div>
+      <div class="set-row"><label>Stall warning after (seconds)</label><input type="number" id="pstStallSeconds" min="10" max="600" value="30"></div>
+      <div class="hint" style="margin:-2px 0 10px">Emails and attachments are written into separate mode-specific folders, so running Attachments only later will not overwrite the email extraction.</div>
+      <div class="idx-actions"><button class="mini primary" id="pstImport" type="button">Start selected mode</button><button class="mini" id="pstDeps" type="button">Check dependencies</button></div>
+      <div class="bar"><i id="pstBar"></i></div><span id="pstText" class="hint"></span>
+      <pre id="pstDiag" style="white-space:pre-wrap;max-height:260px;overflow:auto;color:var(--dim);font-size:10px;border:1px solid var(--border);border-radius:8px;padding:8px;margin-top:8px"></pre>
+    </div>
+
+    <div class="set-sec">
       <h3>Indexing</h3>
       <div class="set-row col"><label>Source folder</label>
         <div class="row-cluster"><select id="folderSel"></select></div>
@@ -433,9 +515,9 @@ input[type=range]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;bac
       <div class="set-row"><label>Passage size (chars)</label><input type="number" id="chunkSize" min="200" max="4000"></div>
       <div class="set-row"><label>Passage overlap (chars)</label><input type="number" id="chunkOverlap" min="0" max="2000"></div>
       <div class="set-row"><label>Use LanceDB vector database</label><span class="switch on" id="sLanceDB"></span></div>
-      <div class="hint" style="margin:-2px 0 10px">Changing size or overlap triggers a clean rebuild. Unchanged documents keep their saved vectors.</div>
+      <div class="hint" style="margin:-2px 0 10px">Add / update preserves previously indexed documents, even when you temporarily narrow File types (for example, indexing only .xlsx). Changing passage size, overlap, or embedding model still requires a clean rebuild.</div>
       <div class="idx-actions">
-        <button class="mini primary" id="ingestInc">Add / update</button>
+        <button class="mini primary" id="ingestInc" title="Adds new/changed files and preserves previously indexed documents excluded by the current File types filter">Add / update</button>
         <button class="mini" id="ingestFull">Rebuild from scratch</button>
         <button class="mini" id="indexClear">Delete index</button>
       </div>
@@ -466,6 +548,8 @@ input[type=range]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;bac
       <div class="set-row"><label>Local reranker (bundled BGE)</label><span class="switch on" id="sRerank"></span></div>
       <div class="set-row"><label>HyDE retrieval variants</label><span class="switch on" id="sHyde"></span></div>
       <div class="set-row"><label>Adaptive RAG by default</label><span class="switch on" id="sAdaptive"></span></div>
+      <div class="set-row"><label>LLM query rewrite</label><span class="switch on" id="sQueryRewrite"></span></div>
+      <div class="hint" style="margin:-2px 0 10px">Turn off to retrieve with the user's exact question. This also disables LLM-generated query variants and HyDE planning.</div>
     </div>
 
     <div class="set-sec">
@@ -477,9 +561,9 @@ input[type=range]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;bac
       <div class="set-row"><label>&nbsp;</label><input type="number" id="ctxWin" min="1024" max="131072"></div>
     </div>
   </div>
-  <div class="settings-foot">
+  <div class="settings-foot"><span class="hint" style="margin-right:auto;align-self:center">Changes save automatically. Server options apply after the local services restart.</span>
     <button id="cancelSettings">Cancel</button>
-    <button id="saveSettings">Save settings</button>
+    <button id="saveSettings" class="saved" type="button" disabled>Auto-saved</button>
   </div>
 </aside>
 <div class="scrim" id="scrim"></div>
@@ -487,6 +571,26 @@ input[type=range]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;bac
 
 <script>
 "use strict";
+const THEME_KEY="offline-rag-theme";
+function preferredTheme(){
+  const saved=localStorage.getItem(THEME_KEY);
+  if(saved==="light"||saved==="dark") return saved;
+  return window.matchMedia&&window.matchMedia("(prefers-color-scheme: light)").matches?"light":"dark";
+}
+function applyTheme(theme,persist=false){
+  const next=theme==="light"?"light":"dark";
+  document.documentElement.dataset.theme=next;
+  if(persist) localStorage.setItem(THEME_KEY,next);
+  const btn=document.getElementById("themeToggle");
+  if(btn){
+    const isLight=next==="light";
+    btn.textContent=isLight?"☾":"☀";
+    btn.title=isLight?"Switch to dark mode":"Switch to light mode";
+    btn.setAttribute("aria-label",btn.title);
+    btn.setAttribute("aria-pressed",String(isLight));
+  }
+}
+applyTheme(preferredTheme());
 const $ = id => document.getElementById(id);
 function el(tag, o){
   o = o || {};
@@ -514,6 +618,10 @@ const logwrap=$("logwrap"), answerBody=$("answerBody"), answerMeta=$("answerMeta
 const evList=$("evList"), evCount=$("evCount"), evIntro=$("evIntro"), toastWrap=$("toast");
 const tgAdaptive=$("tgAdaptive"), tgEvidence=$("tgEvidence");
 const settingsPanel=$("settings"), scrim=$("scrim");
+const chunkModal=$("chunkModal"), chunkTitle=$("chunkTitle"), chunkMeta=$("chunkMeta"), chunkText=$("chunkText");
+const viewerChunkTab=$("viewerChunkTab"), viewerDocumentTab=$("viewerDocumentTab"), viewerMore=$("viewerMore"), viewerProgress=$("viewerProgress");
+const viewerFallback=$("viewerFallback"), viewerRelocateReport=$("viewerRelocateReport");
+let viewerEvidence=null, viewerOffset=0, viewerTotal=0, viewerLoading=false;
 const semWeight=$("semWeight"), semVal=$("semVal"), kwVal=$("kwVal");
 const ingestBar=$("ingestBar"), ingestText=$("ingestText");
 const analysisSel=$("analysisModelSel"), chatSel=$("chatModelSel");
@@ -538,7 +646,9 @@ function buildPipeline(){
     const head=el("div",{class:"stage-head"});
     head.appendChild(el("span",{class:"stage-name",text:name}));
     const st=el("span",{class:"stage-stat s-idle",text:"idle"}); head.appendChild(st);
-    const det=el("div",{class:"stage-detail"}); body.appendChild(det);
+    const det=el("div",{class:"stage-detail"});
+    body.appendChild(head);
+    body.appendChild(det);
     card.appendChild(rail); card.appendChild(body); pipeline.appendChild(card);
     stageEls[id]=card; stageStat[id]=st; stageDetail[id]=det;
   });
@@ -549,6 +659,10 @@ function setStage(id,status,elapsed){
   st.className="stage-stat s-"+status;
   st.textContent = status==="done" ? ("done · "+(elapsed!=null?elapsed+"s":""))
     : status==="active" ? "running" : status==="skipped" ? "skipped" : status==="error" ? "error" : "idle";
+  if(status==="active" && stageDetail[id] && !stageDetail[id].textContent.trim()){
+    const defaults={understand:"Reading the question and preparing search terms…",retrieve:"Searching the local index and ranking matching passages…",analyze:"Reviewing retrieved passages and building evidence notes…",answer:"Preparing the cited response…"};
+    stageDetail[id].appendChild(el("div",{class:"al stage-live",text:defaults[id]||"Processing…"}));
+  }
   if(id==="answer"){
     answerBadge.className="badge b-"+status;
     answerBadge.textContent = status==="active"?"streaming":status==="done"?"done":status==="skipped"?"evidence":status==="error"?"error":"idle";
@@ -582,8 +696,34 @@ function spotlight(n,on,scroll){
   const idx=(+n)-1; const num=sourcesOrder[idx]; if(num==null) return;
   const card=evidenceEls.get(num); if(!card) return;
   card.classList.toggle("spotlight",on);
-  if(on&&scroll) card.scrollIntoView({behavior:"smooth",block:"center"});
-  else if(on) card.scrollIntoView({behavior:"smooth",block:"nearest"});
+  if(on&&scroll) scrollEvidenceToCard(card,true);
+  else if(on) scrollEvidenceToCard(card,false);
+}
+
+function setViewerTab(mode){viewerChunkTab.classList.toggle("open",mode==="chunk");viewerDocumentTab.classList.toggle("open",mode==="document");}
+function viewerMeta(e,documentMode=false){const bits=[];if(e.row)bits.push("Row "+e.row);bits.push("Evidence #"+e.number);if(e.path)bits.push(e.path);if(documentMode&&viewerTotal)bits.push(viewerTotal.toLocaleString()+" extracted characters");else bits.push((e.full_text||"").length+" chunk characters");chunkMeta.textContent=bits.join(" · ");}
+function openChunkViewer(e){viewerEvidence=e;viewerOffset=0;viewerTotal=0;viewerLoading=false;chunkTitle.textContent=(e.source||"Source")+" — "+(e.section||("Passage "+e.number));viewerMeta(e,false);chunkText.textContent=e.full_text||"No source text was supplied.";setViewerTab("chunk");viewerMore.hidden=true;$("viewerOpenOriginal").disabled=!e.path;$("viewerShowFolder").disabled=!e.path;viewerDocumentTab.disabled=!e.path;chunkModal.classList.add("open");chunkModal.setAttribute("aria-hidden","false");document.body.style.overflow="hidden";$("chunkClose").focus();}
+async function openOriginal(path,reveal=false){if(!path){toast("Original file path is unavailable. Rebuild the index once.","err");return;}try{const r=await fetch("/api/open-path?path="+encodeURIComponent(path)+"&reveal="+(reveal?"1":"0"));const d=await r.json().catch(()=>({}));if(!r.ok||!d.success)throw new Error(d.error||("HTTP "+r.status));toast(reveal?"Opened containing folder.":"Opened original document.","ok");}catch(err){toast("Could not open original: "+err.message,"err");addLog("Open original failed: "+err.message,"error");}}
+async function loadDocumentText(reset=false){if(!viewerEvidence||!viewerEvidence.path||viewerLoading)return;viewerLoading=true;setViewerTab("document");if(reset){viewerOffset=0;viewerTotal=0;chunkText.textContent="Extracting whole document text…";viewerMore.hidden=true;}try{const url="/api/document-text?path="+encodeURIComponent(viewerEvidence.path)+"&document_id="+encodeURIComponent(viewerEvidence.document_id||"")+"&offset="+viewerOffset;const r=await fetch(url);let d={};try{d=await r.json();}catch(_){throw new Error("Backend returned an invalid response. Restart app.py and refresh with Ctrl+F5.");}if(!r.ok||!d.success)throw new Error(d.error||("HTTP "+r.status));if(reset)chunkText.textContent=d.text||"No extractable text was found.";else chunkText.textContent+=(d.text?"\n\n"+d.text:"");viewerOffset=d.next_offset==null?d.total_chars:d.next_offset;viewerTotal=d.total_chars||0;
+    if(d.using_fallback){viewerFallback.hidden=false;$("viewerFallbackNote").textContent="Showing retained extracted-text snapshot from "+(d.snapshot_created||"ingestion")+" because the original document no longer exists at the indexed path.";if(reset)toast("Original document not found — using retained extracted-text snapshot.","info");}
+    else if(d.source_kind==="relocated"){viewerFallback.hidden=false;$("viewerFallbackNote").textContent="Original indexed path is missing. A previously relocated matching file is being used: "+d.path;if(reset)toast("Using relocated matching original document.","ok");}
+    else viewerFallback.hidden=true;viewerMore.hidden=!!d.complete;viewerProgress.textContent=(d.complete?"Complete: ":"Loaded ")+viewerOffset.toLocaleString()+" of "+viewerTotal.toLocaleString()+" characters";viewerMeta(viewerEvidence,true);if(reset)chunkText.scrollTop=0;}catch(err){chunkText.textContent="Unable to extract the whole document: "+err.message;viewerMore.hidden=true;toast(err.message,"err");addLog("Whole document view failed: "+err.message,"error");}finally{viewerLoading=false;}}
+async function checkReplacementFolder(){
+  if(!viewerEvidence||!viewerEvidence.document_id){toast("This evidence has no snapshot identity. Rebuild the index once.","err");return;}
+  const folder=$("viewerRelocateFolder").value.trim();if(!folder){toast("Enter the replacement root folder.","err");return;}
+  viewerRelocateReport.textContent="Checking folder structure and file fingerprint…";
+  try{const r=await fetch("/api/document-relocate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({document_id:viewerEvidence.document_id,folder})});const d=await r.json().catch(()=>({}));if(!r.ok||!d.success)throw new Error(d.error||("HTTP "+r.status));
+    const lines=["Expected relative path: "+d.expected_relative_path,"Replacement root: "+d.search_root,"Expected path missing: "+(d.missing_expected_path?"YES":"NO")];
+    if(d.exact_match){lines.push("EXACT CONTENT MATCH: "+d.exact_match.path);lines.push("Structure match: "+(d.exact_match.structure_match?"YES":"NO — file moved within the folder tree"));toast("Matching original file found and linked.","ok");}
+    else{lines.push("NO EXACT CONTENT MATCH FOUND.");toast("No matching original file found; snapshot remains available.","err");}
+    if((d.discrepancies||[]).length){lines.push("","Discrepancies:",...d.discrepancies.map(x=>"- "+x));}
+    if((d.candidates||[]).length){lines.push("","Candidates checked:",...d.candidates.map(x=>"- "+x.relative_path+" | size match="+x.size_match+" | content match="+x.fingerprint_match));}
+    viewerRelocateReport.textContent=lines.join("\n");
+  }catch(err){viewerRelocateReport.textContent="Folder check failed: "+err.message;toast(err.message,"err");}
+}
+function closeChunkViewer(){
+  chunkModal.classList.remove("open"); chunkModal.setAttribute("aria-hidden","true");
+  document.body.style.overflow="";
 }
 
 /* ---------- evidence cards ---------- */
@@ -607,9 +747,17 @@ function buildCard(meta,isStreaming){
   card._refs={icon,tag,fill,pct,body,foot};
   return card;
 }
+function scrollEvidenceToCard(card,center=false){
+  if(!card||!evList) return;
+  const top=card.offsetTop-evList.offsetTop;
+  const target=center ? top-(evList.clientHeight-card.offsetHeight)/2
+                      : Math.max(0,top+card.offsetHeight-evList.clientHeight);
+  evList.scrollTo({top:target,behavior:"smooth"});
+}
 function startCard(meta){
   const card=buildCard(meta,true); evidenceEls.set(meta.number,card);
-  evList.appendChild(card); card.scrollIntoView({block:"nearest",behavior:"smooth"}); updateEvCount();
+  evList.appendChild(card); updateEvCount();
+  requestAnimationFrame(()=>scrollEvidenceToCard(card,false));
 }
 function deltaCard(num,text){
   const card=evidenceEls.get(num); if(!card) return;
@@ -618,27 +766,37 @@ function deltaCard(num,text){
 function doneCard(e){
   let card=evidenceEls.get(e.number);
   if(!card){ card=buildCard(e,false); evidenceEls.set(e.number,card); evList.appendChild(card); }
-  const r=card._refs; const rel=(e.relevance||"RELATED").toLowerCase();
+  const r=card._refs; const rel=(e.raw_evidence?"raw":(e.relevance||"RELATED").toLowerCase());
+  card._fullText=e.full_text||""; card.dataset.rawEvidence=e.raw_evidence?"1":"0";
   card.classList.remove("streaming"); card.classList.add("rel-"+rel);
   r.icon.textContent="✓";
-  r.tag.textContent=e.relevance; r.tag.className="ev-tag t-"+rel;
+  r.tag.textContent=e.raw_evidence?"RAW":e.relevance; r.tag.className="ev-tag t-"+rel;
   const pc=Math.round((e.semantic||0)*100);
   r.fill.style.width=Math.max(3,pc)+"%"; r.pct.textContent=pc+"%";
   r.body.innerHTML=""; r.body.appendChild(el("span",{class:"ev-text",text:e.parsed||e.fact||""}));
   r.foot.innerHTML="";
-  r.foot.appendChild(el("span",{class:"ev-verdict",text:(e.verdict||"ANALYZED")+(e.elapsed!=null?" · "+e.elapsed+"s":"")}));
-  const mo=el("button",{class:"mo-btn",text:"model output"}); mo.type="button";
-  const pre=el("pre",{class:"mo-raw",text:e.raw||""}); pre.hidden=true;
-  mo.addEventListener("click",()=>{ pre.hidden=!pre.hidden; mo.classList.toggle("open",!pre.hidden); });
-  r.foot.appendChild(mo); r.foot.appendChild(pre);
+  const statusText=(e.raw_evidence?"RAW EVIDENCE · NO LLM ANALYSIS":(e.analysis_error?"SOURCE PREVIEW · ANALYSIS UNAVAILABLE":(e.verdict||"ANALYZED")))+(e.elapsed!=null?" · "+e.elapsed+"s":"");
+  r.foot.appendChild(el("span",{class:"ev-verdict",text:statusText}));
+  const actions=el("span",{class:"ev-actions"});
+  const full=el("button",{class:"mo-btn",text:"view full chunk"}); full.type="button";
+  full.addEventListener("click",()=>openChunkViewer(e)); actions.appendChild(full);
+  const doc=el("button",{class:"mo-btn",text:"whole document"}); doc.type="button"; doc.disabled=!e.path; doc.addEventListener("click",()=>{openChunkViewer(e);loadDocumentText(true);}); actions.appendChild(doc);
+  const open=el("button",{class:"mo-btn",text:"open original"}); open.type="button"; open.disabled=!e.path; open.addEventListener("click",()=>openOriginal(e.path,false)); actions.appendChild(open);
+  if(e.raw){
+    const mo=el("button",{class:"mo-btn",text:"model output"}); mo.type="button";
+    const pre=el("pre",{class:"mo-raw",text:e.raw}); pre.hidden=true;
+    mo.addEventListener("click",()=>{ pre.hidden=!pre.hidden; mo.classList.toggle("open",!pre.hidden); });
+    actions.appendChild(mo); r.foot.appendChild(actions); r.foot.appendChild(pre);
+  }else{ r.foot.appendChild(actions); }
   updateEvCount(); bumpAnalyze(e);
 }
 function updateEvCount(){
-  let ans=0,par=0;
-  evidenceEls.forEach(c=>{ const t=c._refs.tag.textContent; if(t==="ANSWERS")ans++; else if(t==="PARTIAL")par++; });
-  let txt=evidenceEls.size+" analysed";
-  if(ans) txt+=" · "+ans+" answers"; if(par) txt+=" · "+par+" partial";
+  let ans=0,par=0,raw=0;
+  evidenceEls.forEach(c=>{ const t=c._refs.tag.textContent; if(t==="ANSWERS")ans++; else if(t==="PARTIAL")par++; else if(t==="RAW")raw++; });
+  let txt=evidenceEls.size+" chunk"+(evidenceEls.size===1?"":"s");
+  if(raw) txt+=" · "+raw+" raw"; if(ans) txt+=" · "+ans+" answers"; if(par) txt+=" · "+par+" partial";
   evCount.textContent=txt;
+  const copy=$("copyEvidence"); if(copy) copy.disabled=evidenceEls.size===0;
   if(evIntro) evIntro.hidden = evidenceEls.size>0;
 }
 
@@ -934,6 +1092,7 @@ function updSem(){ semVal.textContent=semWeight.value; kwVal.textContent=100-(+s
 function fillSettings(s){
   setVal("lmUrl",s.lmstudio_url); setVal("folderInput",s.source_folder); setVal("fileTypes",s.include_extensions);
   setVal("chunkSize",s.chunk_size); setVal("chunkOverlap",s.chunk_overlap);
+  setVal("pstPath",s.pst_path); setVal("pstProcessingMode",s.pst_processing_mode||"emails_only"); setVal("pstSimilarity",s.pst_similarity_threshold); setVal("pstAttachmentTypes",s.pst_attachment_extensions); setVal("pstStallSeconds",s.pst_stall_warning_seconds||30); setSwitch("sPstAttachments",s.pst_extract_attachments !== false);
   semWeight.value=Math.round((+s.semantic_weight||0.72)*100); updSem();
   setVal("candCount",s.candidate_count); setVal("checkpoint",s.rerank_count); setVal("maxChecks",s.max_candidate_checks);
   
@@ -950,6 +1109,7 @@ function fillSettings(s){
 function gather(){
   const sw=+semWeight.value;
   return { lmstudio_url:val("lmUrl"), source_folder:val("folderInput"), include_extensions:val("fileTypes"),
+    pst_path:val("pstPath"), pst_processing_mode:val("pstProcessingMode"), pst_similarity_threshold:+val("pstSimilarity"), pst_attachment_extensions:val("pstAttachmentTypes"), pst_extract_attachments:switchOn("sPstAttachments"), pst_stall_warning_seconds:+val("pstStallSeconds"),
     chunk_size:+val("chunkSize"), chunk_overlap:+val("chunkOverlap"),
     semantic_weight:sw/100, keyword_weight:(100-sw)/100,
     candidate_count:+val("candCount"), rerank_count:+val("checkpoint"), max_candidate_checks:+val("maxChecks"),
@@ -965,17 +1125,54 @@ function openSettings(){
     fetch("/api/options").then(r=>r.json()).catch(()=>({folders:[]})),
     refreshModels()
   ]).then(([s,opt])=>{
+    settingsLoading=true;
     const fsel=$("folderSel"); fsel.innerHTML="";
     (opt.folders||[]).forEach(f=>fsel.appendChild(el("option",{value:f.value,text:f.label||f.value})));
     fillSettings(s);
+    settingsLoading=false; setSaveState("saved","Auto-saved");
     fetchLocalModels();
-  });
+  }).catch(e=>{settingsLoading=false;setSaveState("failed","Load failed");toast("Settings load failed: "+e.message,"err");});
 }
 function closeSettings(){ settingsPanel.classList.remove("open"); scrim.classList.remove("open"); settingsPanel.setAttribute("aria-hidden","true"); }
-function saveSettings(){
-  fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(gather())})
-    .then(r=>r.json()).then(s=>{ fillSettings(s); refreshModels(); toast("Settings saved","ok"); })
-    .catch(e=>toast("Save failed: "+e.message,"err"));
+let autoSaveTimer=0, autoSaveSeq=0, settingsLoading=false;
+function setSaveState(state,text){
+  const b=$("saveSettings"); if(!b) return;
+  b.className=state; b.textContent=text;
+}
+async function saveSettingsNow(){
+  if(settingsLoading) return;
+  const seq=++autoSaveSeq;
+  setSaveState("saving","Saving…");
+  try{
+    const r=await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(gather())});
+    const data=await r.json().catch(()=>({}));
+    if(!r.ok) throw new Error(data.error||("HTTP "+r.status));
+    if(seq!==autoSaveSeq) return;
+    // Do not call fillSettings here: rewriting active controls while the user is
+    // typing causes cursor jumps. The server response is already authoritative.
+    setSaveState("saved","Auto-saved");
+    refreshModels(); fetchLocalModels();
+  }catch(e){
+    if(seq!==autoSaveSeq) return;
+    setSaveState("failed","Save failed");
+    toast("Auto-save failed: "+e.message,"err");
+    addLog("Settings auto-save failed: "+e.message,"error");
+  }
+}
+function scheduleSettingsSave(delay=550){
+  if(settingsLoading) return;
+  clearTimeout(autoSaveTimer);
+  setSaveState("saving","Pending…");
+  autoSaveTimer=setTimeout(saveSettingsNow,delay);
+}
+function bindAutoSave(){
+  document.querySelectorAll("#settings input, #settings select").forEach(control=>{
+    // Model selectors have their own load/apply workflows below.
+    if(["analysisModelSel","chatModelSel","embedModelSel","rerankModelSel","folderSel"].includes(control.id)) return;
+    control.addEventListener(control.type==="range"?"input":"change",()=>scheduleSettingsSave(control.type==="text"?700:350));
+    if(control.type==="text"||control.type==="number") control.addEventListener("input",()=>scheduleSettingsSave(700));
+  });
+  document.querySelectorAll("#settings .switch").forEach(sw=>sw.addEventListener("click",()=>scheduleSettingsSave(250)));
 }
 
 /* ---------- ingest ---------- */
@@ -992,29 +1189,58 @@ function runIngest(mode){
       else if(e.type==="progress"){ ingestBar.style.width=(e.percent||0)+"%"; ingestText.textContent=e.text||""; }
       else if(e.type==="error"){ toast(e.error||"Ingest error","err"); addLog(e.error||"error","error"); }
       else if(e.type==="done"){ ingestBar.style.width="100%";
-        ingestText.textContent="Done — "+e.documents+" docs, "+e.chunks+" passages.";
+        ingestText.textContent="Done — combined index: "+e.documents+" docs, "+e.chunks+" passages.";
         toast("Index updated: "+e.chunks+" passages","ok"); refreshStatus(); }
     });
   }).catch(e=>toast(e.message,"err")).finally(()=>setIngesting(false));
 }
 
+async function copyAllEvidence(){
+  const chunks=[];
+  evidenceEls.forEach((card,num)=>{
+    const raw=card._fullText||card.querySelector(".ev-text")?.textContent||"";
+    if(raw.trim()) chunks.push("--- Evidence #"+num+" ---\n"+raw.trim());
+  });
+  if(!chunks.length){ toast("No evidence chunks to copy.","err"); return; }
+  const userQuery=query.value.trim()||"(empty)";
+  const combined="User query: "+userQuery+"\n\n"+chunks.join("\n\n");
+  try{ await navigator.clipboard.writeText(combined); }
+  catch(_){
+    const ta=document.createElement("textarea"); ta.value=combined; ta.style.position="fixed"; ta.style.opacity="0";
+    document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove();
+  }
+  toast(chunks.length+" full chunk"+(chunks.length===1?"":"s")+" copied.","ok");
+}
+
 /* ---------- wire up ---------- */
 function attach(){
+  $("themeToggle").addEventListener("click",()=>{
+    const current=document.documentElement.dataset.theme||preferredTheme();
+    applyTheme(current==="light"?"dark":"light",true);
+  });
   askBtn.addEventListener("click",runQuery);
   stopBtn.addEventListener("click",stop);
   query.addEventListener("keydown",e=>{ if(e.key==="Enter"){ e.preventDefault(); runQuery(); } });
-  document.addEventListener("keydown",e=>{ if(e.key==="Escape"){ if(settingsPanel.classList.contains("open")) closeSettings(); else stop(); } });
+  document.addEventListener("keydown",e=>{ if(e.key==="Escape"){ if(chunkModal.classList.contains("open")) closeChunkViewer(); else if(settingsPanel.classList.contains("open")) closeSettings(); else stop(); } });
   $("clearLog").addEventListener("click",()=>{ logwrap.innerHTML=""; });
+  $("copyEvidence").addEventListener("click",copyAllEvidence);
   [tgAdaptive,tgEvidence].forEach(sw=>sw.addEventListener("click",()=>{
     sw.classList.toggle("on");
     if(sw===tgAdaptive){ fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({adaptive_rag:switchOn("tgAdaptive")})}).catch(()=>{}); }
   }));
+  $("chunkClose").addEventListener("click",closeChunkViewer);
+  chunkModal.addEventListener("click",e=>{if(e.target===chunkModal)closeChunkViewer();});
+  viewerChunkTab.addEventListener("click",()=>{if(!viewerEvidence)return;setViewerTab("chunk");viewerMeta(viewerEvidence,false);chunkText.textContent=viewerEvidence.full_text||"No source text was supplied.";viewerMore.hidden=true;});
+  viewerDocumentTab.addEventListener("click",()=>loadDocumentText(true));
+  $("viewerLoadMore").addEventListener("click",()=>loadDocumentText(false));
+  $("viewerOpenOriginal").addEventListener("click",()=>viewerEvidence&&openOriginal(viewerEvidence.path,false));
+  $("viewerShowFolder").addEventListener("click",()=>viewerEvidence&&openOriginal(viewerEvidence.path,true));
+  $("viewerCheckFolder").addEventListener("click",checkReplacementFolder);
   $("openSettings").addEventListener("click",openSettings);
   $("closeSettings").addEventListener("click",closeSettings);
   $("cancelSettings").addEventListener("click",closeSettings);
   scrim.addEventListener("click",closeSettings);
-  $("saveSettings").addEventListener("click",saveSettings);
   semWeight.addEventListener("input",updSem);
 
   $("loadAnalysis").addEventListener("click",()=>loadModel(analysisSel.value));
@@ -1034,7 +1260,7 @@ function attach(){
     if(chatModel && !loadedIds.has(chatModel)) loadModel(chatModel);
   });
 
-  $("folderSel").addEventListener("change",e=>{ setVal("folderInput",e.target.value); });
+  $("folderSel").addEventListener("change",e=>{ setVal("folderInput",e.target.value); scheduleSettingsSave(150); });
   $("ingestInc").addEventListener("click",()=>runIngest("incremental"));
   $("ingestFull").addEventListener("click",()=>runIngest("full"));
   $("indexClear").addEventListener("click",()=>{
@@ -1045,20 +1271,44 @@ function attach(){
   });
   document.querySelectorAll(".settings .switch").forEach(sw=>sw.addEventListener("click",()=>sw.classList.toggle("on")));
 
+  $("pstDeps").addEventListener("click",()=>{fetch("/api/pst/dependencies").then(r=>r.json()).then(d=>{const msg=d.missing&&d.missing.length?("Missing: "+d.missing.map(x=>x.module).join(", ")+". Run: "+d.install_all):"PST dependencies are installed.";$("pstText").textContent=msg;toast(msg,d.missing&&d.missing.length?"err":"ok");}).catch(e=>toast(e.message,"err"));});
+  $("pstImport").addEventListener("click",async()=>{const path=val("pstPath").trim(),mode=val("pstProcessingMode");if(!path){toast("Enter a PST file path.","err");return;}const btn=$("pstImport"),bar=$("pstBar"),txt=$("pstText"),diag=$("pstDiag");btn.disabled=true;bar.style.width="2%";txt.textContent="Starting "+mode.replaceAll("_"," ")+"…";diag.textContent="";
+    try{await saveSettingsNow();const r=await fetch("/api/pst/import",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({pst_path:path})});const started=await r.json();if(!r.ok||!started.success)throw new Error(started.error||"PST extraction could not start");
+      while(true){await new Promise(resolve=>setTimeout(resolve,750));const sr=await fetch("/api/pst/status?job="+encodeURIComponent(started.job));const d=await sr.json();if(!sr.ok)throw new Error(d.error||"Could not read PST status");bar.style.width=Math.max(2,d.percent||2)+"%";const elapsed=d.elapsed_seconds||0,idle=d.idle_seconds||0;txt.textContent=(d.stalled?"⚠ Possible stall: ":"")+(d.message||"Processing PST…")+` — elapsed ${elapsed}s, unchanged ${idle}s`+(d.log_file?` — log: ${d.log_file}`:"");diag.textContent=(d.history||[]).map(x=>x.time+"  "+x.message).join("\n");diag.scrollTop=diag.scrollHeight;
+        if(d.state==="done"){const x=d.result||{};txt.textContent=`${x.processing_mode||mode} completed: ${x.emails||0} emails inspected, ${x.conversations||0} conversations, ${x.attachments||0} retained attachments. Output: ${x.output||""}. Run Add / update to index.`;toast("PST mode complete","ok");break;}if(d.state==="error")throw new Error((d.error||d.message||"PST extraction failed")+(d.dependency_help?" Run: "+d.dependency_help:""));}}
+    catch(e){bar.style.width="0";txt.textContent=e.message;toast(e.message,"err");}finally{btn.disabled=false;}});
   // local models
   $("embedApply").addEventListener("click",()=>applyLocalModel("embedding"));
   $("rerankApply").addEventListener("click",()=>applyLocalModel("reranker"));
   $("embedDownload").addEventListener("click",()=>downloadLocalModel("embedding"));
   $("rerankDownload").addEventListener("click",()=>downloadLocalModel("reranker"));
-  embedSel.addEventListener("change",()=>{localSel.embedding=embedSel.value;});
-  rerankSel.addEventListener("change",()=>{localSel.reranker=rerankSel.value;});
+  embedSel.addEventListener("change",()=>{
+    localSel.embedding=embedSel.value;
+    const m=localCatalog.find(x=>x.id===embedSel.value);
+    if(m&&m.downloaded) applyLocalModel("embedding");
+    else if(m) toast("Download the selected embedding model to apply it.","info");
+  });
+  rerankSel.addEventListener("change",()=>{
+    localSel.reranker=rerankSel.value;
+    const m=localCatalog.find(x=>x.id===rerankSel.value);
+    if(m&&m.downloaded) applyLocalModel("reranker");
+    else if(m) toast("Download the selected reranker model to apply it.","info");
+  });
   $("chunkSize").addEventListener("input",()=>{if(localCatalog.length)renderLocalModels();});
 }
 
 /* ---------- boot ---------- */
+applyTheme(preferredTheme());
+if(window.matchMedia){
+  const themeMedia=window.matchMedia("(prefers-color-scheme: light)");
+  themeMedia.addEventListener?.("change",e=>{
+    if(!localStorage.getItem(THEME_KEY)) applyTheme(e.matches?"light":"dark");
+  });
+}
 buildPipeline();
 renderAnswer();
 attach();
+bindAutoSave();
 refreshStatus();
 fetchLocalModels();
 refreshModels().then(()=>fetch("/api/settings").then(r=>r.json()).then(s=>{

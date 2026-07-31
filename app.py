@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import array
+import errno
 import atexit
 import json
 import math
@@ -13,7 +14,13 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlparse, parse_qs
 import uuid
+import tempfile
+import hashlib
+import gzip
+from datetime import datetime
+from difflib import SequenceMatcher
 import xml.etree.ElementTree as ET
 import zipfile
 import zlib
@@ -70,20 +77,40 @@ DEFAULTS = {
     "use_llm_rerank": True,
     "answer_temperature": 0.1,
     "answer_tokens": 900,
-    "include_extensions": ".txt,.md,.csv,.pdf,.docx,.xlsx,.xlsm",
+    "include_extensions": ".txt,.md,.csv,.json,.jsonl,.pdf,.doc,.docx,.xls,.xlsx,.xlsm,.pptx,.msg",
     "max_row_chars": 5000,
     "adaptive_rag": True,
+    "use_query_rewrite": True,
     "use_hyde": True,
     "use_lancedb": True, 
     "gpu_offload": True,  
     "gpu_layers": 99,   
+    "local_server_parallel": 1,
+    "embedding_workers": 1,
+    "local_server_batch": 2048,
     "fast_path_score": 0.82,           
     "memory_fact_limit": 18,
     "context_window": 8192,
+    "pst_path": "",
+    "pst_similarity_threshold": 90,
+    "pst_attachment_extensions": ".msg,.pdf,.xlsx,.xlsm,.docx",
+    "pst_extract_attachments": True,
+    "pst_processing_mode": "emails_only",
+    "pst_stall_warning_seconds": 30,
 }
 
 lock = threading.Lock()
+_JSON_LOCKS = {}
+_JSON_LOCKS_GUARD = threading.Lock()
 _EMBED_CACHE = {}
+_DOCUMENT_TEXT_CACHE = {}
+_DOCUMENT_TEXT_CACHE_LOCK = threading.Lock()
+DOCUMENT_TEXT_CACHE_LIMIT = 12
+DOCUMENT_VIEW_PAGE_CHARS = 200000
+SNAPSHOT_DIR = DATA / "document_snapshots"
+SNAPSHOT_MANIFEST_FILE = DATA / "document_manifest.json"
+SNAPSHOT_DIR.mkdir(exist_ok=True)
+SNAPSHOT_MANIFEST_LOCK = threading.RLock()
 
 # --------------------------------------------------------------------------- #
 #  RAM IN-MEMORY INDEX CACHE (Lightning fast retrieval)
@@ -147,7 +174,7 @@ MAX_SERVER_CTX = 8192
 
 BUILTIN_CATALOG = [
     {"id": "nomic-embed-text-v1.5.Q4_K_M.gguf", "kind": "embedding",
-     "name": "Nomic Embed v1.5 (Q4)", "ctx": 8192, "verified": True,
+     "name": "Nomic Embed v1.5 (Q4)", "ctx": 2048, "verified": True,
      "urls": ["https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q4_K_M.gguf"]},
     {"id": "bge-m3-Q4_K_M.gguf", "kind": "embedding",
      "name": "BGE-M3 multilingual (Q4)", "ctx": 8192, "verified": True,
@@ -213,12 +240,26 @@ class LocalServer:
         self._lock = threading.Lock()
         self.gpu_layers = 0          # layers actually offloaded this start (0 = CPU)
         self.gpu_fell_back = False   # True if we tried GPU and had to drop to CPU
+        self.parallel = 1             # concurrent llama-server slots
+        self.physical_batch = 2048    # tokens processed in one physical batch
 
-    def build_args(self, threads, layers=0):
-        ctx = min(int(self.nominal_ctx or 2048), MAX_SERVER_CTX)
+    def build_args(self, threads, layers=0, parallel=1, physical_batch=2048):
+        # llama-server divides the total context across parallel slots. Allocate
+        # nominal_ctx per slot so increasing concurrency does not silently turn an
+        # 8192-token model into 2048 tokens per request.
+        per_slot_ctx = min(int(self.nominal_ctx or 2048), MAX_SERVER_CTX)
+        parallel = positive(parallel, 1, 1, 16)
+        total_ctx = per_slot_ctx * parallel
+        # Context (-c) and physical batch (-b/-ub) are independent limits.
+        # llama-server can have an 8K context yet reject a 529-token request when
+        # the physical batch is only 512. Keep batch and micro-batch equal for
+        # embedding/reranking to avoid llama.cpp reducing n_batch back to n_ubatch.
+        physical_batch = positive(physical_batch, 2048, 512, MAX_SERVER_CTX)
+        physical_batch = min(physical_batch, per_slot_ctx)
         args = [str(LLAMA_SERVER), "-m", str(MODELS_DIR / self.file),
             "--host", "127.0.0.1", "--port", str(self.port),
-            "-t", str(threads), "-c", str(ctx), "-b", str(ctx), "-ub", str(ctx)]
+            "-t", str(threads), "-c", str(total_ctx), "-np", str(parallel),
+            "-b", str(physical_batch), "-ub", str(physical_batch)]
         if layers and layers > 0:
             args += ["-ngl", str(int(layers))]      # GPU layer offload
         args.append("--embedding" if self.kind == "embedding" else "--reranking")
@@ -238,7 +279,7 @@ class LocalServer:
                 pass
         self.state = "off"
 
-    def start(self, file_id, nominal_ctx, threads, gpu_layers=0):
+    def start(self, file_id, nominal_ctx, threads, gpu_layers=0, parallel=1, physical_batch=2048):
         self.stop()
         self.file = file_id
         self.nominal_ctx = nominal_ctx
@@ -246,6 +287,8 @@ class LocalServer:
         self.error = ""
         self.gpu_layers = int(gpu_layers or 0)
         self.gpu_fell_back = False
+        self.parallel = positive(parallel, 1, 1, 16)
+        self.physical_batch = positive(physical_batch, 2048, 512, MAX_SERVER_CTX)
         if not (MODELS_DIR / file_id).exists():
             self.state = "missing"
             self.error = f"{file_id} is not in the models folder yet."
@@ -258,7 +301,7 @@ class LocalServer:
         log = open(LOG_DIR / f"{self.kind}-server.log", "ab", buffering=0)
         flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
         try:
-            self.proc = subprocess.Popen(self.build_args(threads, self.gpu_layers),
+            self.proc = subprocess.Popen(self.build_args(threads, self.gpu_layers, self.parallel, self.physical_batch),
                 stdin=subprocess.DEVNULL, creationflags=flags)
         except Exception as exc:
             self.state = "error"
@@ -267,15 +310,15 @@ class LocalServer:
         self.state = "starting"
         return True
 
-    def start_with_fallback(self, file_id, nominal_ctx, threads, gpu_layers):
+    def start_with_fallback(self, file_id, nominal_ctx, threads, gpu_layers, parallel=1, physical_batch=2048):
         """Start on GPU if requested; if the GPU fails to init, retry on CPU."""
-        ok = self.start(file_id, nominal_ctx, threads, gpu_layers)
+        ok = self.start(file_id, nominal_ctx, threads, gpu_layers, parallel, physical_batch)
         if ok:
             ok = self.wait_ready(120)
         if (not ok) and gpu_layers and gpu_layers > 0:
             self.gpu_fell_back = True
             print(f"[{self.kind}] GPU offload failed to start - falling back to CPU.")
-            ok = self.start(file_id, nominal_ctx, threads, 0)
+            ok = self.start(file_id, nominal_ctx, threads, 0, parallel, physical_batch)
             if ok:
                 ok = self.wait_ready(120)
         return ok
@@ -325,7 +368,8 @@ class LocalServer:
             "nominal_ctx": self.nominal_ctx, "effective_ctx": self.eff_ctx,
             "gpu_backend": detect_gpu_backend(),
             "gpu_layers": self.gpu_layers,
-            "gpu_fell_back": self.gpu_fell_back}
+            "gpu_fell_back": self.gpu_fell_back, "parallel": self.parallel,
+            "physical_batch": self.physical_batch}
 
 EMBED_SERVER = LocalServer("embedding", EMBEDDING_PORT)
 RERANK_SERVER = LocalServer("reranker", RERANK_PORT)
@@ -340,7 +384,9 @@ def _start_one(kind, cfg):
     srv = _server_for(kind)
     gpu_on = bool(cfg.get("gpu_offload", True)) and detect_gpu_backend() != "cpu"
     layers = positive(cfg.get("gpu_layers"), 99, 0, 999) if gpu_on else 0
-    srv.start_with_fallback(entry["id"], entry.get("ctx", 2048), HARDWARE["cores"], layers)
+    parallel = positive(cfg.get("local_server_parallel"), 1, 1, 16)
+    physical_batch = positive(cfg.get("local_server_batch"), 2048, 512, MAX_SERVER_CTX)
+    srv.start_with_fallback(entry["id"], entry.get("ctx", 2048), HARDWARE["cores"], layers, parallel, physical_batch)
 
 def _start_local_servers(cfg, wait=False):
     def run():
@@ -397,6 +443,9 @@ def load(path, default):
 
 def settings():
     config = {**DEFAULTS, **load(SETTINGS_FILE, {})}
+    # Repair older settings files where the UI accidentally saved File types as blank.
+    if not str(config.get("include_extensions") or "").strip():
+        config["include_extensions"] = DEFAULTS["include_extensions"]
     if not config["source_folder"] or not Path(config["source_folder"]).is_dir():
         config["source_folder"] = DEFAULTS["source_folder"]
     if config.get("chat_model") == "auto":
@@ -406,11 +455,52 @@ def settings():
     return config
 
 
+def _json_lock_for(path):
+    key = str(Path(path).resolve()).lower() if os.name == "nt" else str(Path(path).resolve())
+    with _JSON_LOCKS_GUARD:
+        return _JSON_LOCKS.setdefault(key, threading.RLock())
+
+
 def save_json(path, value):
-    tmp = path.with_suffix(".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(value, f, ensure_ascii=False, indent=2)
-    tmp.replace(path)
+    """Safely save JSON even when browser auto-save requests overlap on Windows."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    file_lock = _json_lock_for(path)
+    with file_lock:
+        # A unique file prevents concurrent requests from writing/renaming the same
+        # settings.tmp. Keep it in the target directory so os.replace stays atomic.
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=path.name + ".", suffix=".tmp", dir=str(path.parent)
+        )
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(json_safe(value), stream, ensure_ascii=False, indent=2)
+                stream.flush()
+                os.fsync(stream.fileno())
+            last_error = None
+            for attempt in range(8):
+                try:
+                    os.replace(str(tmp), str(path))
+                    return
+                except PermissionError as exc:
+                    last_error = exc
+                    # Windows may briefly hold the destination during antivirus,
+                    # backup, indexing, or another request's replace operation.
+                    if os.name != "nt":
+                        raise
+                    time.sleep(0.05 * (attempt + 1))
+                except OSError as exc:
+                    last_error = exc
+                    if os.name != "nt" or getattr(exc, "winerror", None) not in (5, 32, 33):
+                        raise
+                    time.sleep(0.05 * (attempt + 1))
+            raise last_error or RuntimeError(f"Could not replace {path}")
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def text(value):
@@ -434,13 +524,45 @@ def file_signature(path):
 
 
 def chunk_params_sig(config):
-    keys = ("chunk_size", "chunk_overlap", "max_row_chars", "include_extensions")
+    # File type selection controls which documents are scanned during this run;
+    # it does not change how an existing passage was chunked or embedded.
+    # Therefore include_extensions must NOT be part of this signature, otherwise
+    # changing from .txt to .xlsx incorrectly forces a destructive full rebuild.
+    keys = ("chunk_size", "chunk_overlap", "max_row_chars")
     base = "|".join(str(config.get(k)) for k in keys)
     return base + "|emb=" + normalize_embed_id(config.get("embedding_model"))
 
 
+def json_safe(value):
+    """Recursively convert vectors and database scalar types to JSON-safe values."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, array.array):
+        return list(value)
+    if NUMPY_AVAILABLE and isinstance(value, np.ndarray):
+        return value.tolist()
+    if hasattr(value, "as_py"):
+        try:
+            return json_safe(value.as_py())
+        except Exception:
+            pass
+    if hasattr(value, "tolist"):
+        try:
+            return json_safe(value.tolist())
+        except Exception:
+            pass
+    if isinstance(value, dict):
+        return {str(k): json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [json_safe(v) for v in value]
+    if isinstance(value, Path):
+        return str(value)
+    return str(value)
+
+
 def public(item):
-    return {k: v for k, v in item.items() if k != "embedding"}
+    return json_safe({k: v for k, v in item.items()
+                      if k not in ("embedding", "vector", "_vec_buf")})
 
 
 def hardware_profile():
@@ -579,13 +701,361 @@ def read_pdf(path):
         return pdf_fallback(path)
 
 
+def read_pptx(path):
+    """Extract text from PowerPoint slides without requiring PowerPoint."""
+    slide_re = re.compile(r"ppt/slides/slide(\d+)\.xml$")
+    with zipfile.ZipFile(path) as z:
+        slides = []
+        for name in z.namelist():
+            match = slide_re.match(name)
+            if match:
+                slides.append((int(match.group(1)), name))
+        for slide_no, name in sorted(slides):
+            root = ET.fromstring(z.read(name))
+            values = [node.text or "" for node in root.iter()
+                      if node.tag.endswith("}t") and (node.text or "").strip()]
+            content = "\n".join(values).strip()
+            if content:
+                yield f"Slide {slide_no}", None, content
+
+
+def read_json_lines(path):
+    """Read JSON/JSONL as searchable, line-addressable text."""
+    raw = path.read_text(encoding="utf-8", errors="replace")
+    if path.suffix.lower() == ".json":
+        try:
+            value = json.loads(raw)
+            raw = json.dumps(value, ensure_ascii=False, indent=2)
+        except json.JSONDecodeError:
+            pass
+    for number, line in enumerate(raw.splitlines(), 1):
+        line = line.strip()
+        if line:
+            yield "JSON", number, line
+
+
+def read_legacy_doc(path):
+    """Extract old binary .doc text using an available local converter."""
+    commands = [["antiword", str(path)]]
+    if os.name == "nt":
+        commands += [["powershell", "-NoProfile", "-Command",
+                      "$w=New-Object -ComObject Word.Application; $w.Visible=$false; "
+                      f"$d=$w.Documents.Open('{str(path).replace(chr(39), chr(39)*2)}'); "
+                      "$t=$d.Content.Text; $d.Close(); $w.Quit(); [Console]::OutputEncoding=[Text.Encoding]::UTF8; $t"]]
+    for command in commands:
+        try:
+            return subprocess.check_output(command, text=True, encoding="utf-8",
+                                           errors="replace", stderr=subprocess.DEVNULL,
+                                           timeout=120)
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            continue
+    raise RuntimeError("Legacy .doc requires Microsoft Word or antiword. Convert the file to .docx if extraction fails.")
+
+
+def read_legacy_xls(path):
+    """Extract old .xls workbooks using xlrd when installed."""
+    try:
+        import xlrd
+    except ImportError as exc:
+        raise RuntimeError(
+            f"Legacy .xls found but xlrd is not installed. Install with: {sys.executable} -m pip install xlrd"
+        ) from exc
+    book = xlrd.open_workbook(str(path), on_demand=True)
+    try:
+        for sheet in book.sheets():
+            if sheet.nrows == 0:
+                continue
+            headers = [text(sheet.cell_value(0, col)) or col_name(col + 1)
+                       for col in range(sheet.ncols)]
+            for row_no in range(1, sheet.nrows):
+                values = [text(sheet.cell_value(row_no, col)) for col in range(sheet.ncols)]
+                line = " | ".join(f"{headers[i]}: {value}"
+                                  for i, value in enumerate(values) if value)
+                if line:
+                    yield sheet.name, row_no + 1, line
+    finally:
+        book.release_resources()
+
+
+def read_msg(path):
+    """Read a standalone Outlook .msg export when extract-msg is installed."""
+    try:
+        import extract_msg
+    except ImportError as exc:
+        raise RuntimeError(
+            "Outlook .msg file found but extract-msg is not installed. "
+            f"Install it with: {sys.executable} -m pip install extract-msg"
+        ) from exc
+    msg = extract_msg.Message(str(path))
+    try:
+        parts = [
+            f"Subject: {msg.subject or ''}",
+            f"From: {msg.sender or ''}",
+            f"To: {msg.to or ''}",
+            f"CC: {getattr(msg, 'cc', '') or ''}",
+            f"Date: {msg.date or ''}",
+            "",
+            msg.body or "",
+        ]
+        return "\n".join(parts)
+    finally:
+        msg.close()
+
+def split_text_chunks(content, size, overlap):
+    """Create near-target chunks while preserving text and configured overlap.
+
+    chunk_size is a maximum target, not a guaranteed minimum. Short source units
+    stay short. Longer units use natural boundaries and a balanced final pair.
+    """
+    content = str(content or "").strip()
+    if not content:
+        return []
+    if len(content) <= size:
+        return [content]
+    overlap = max(0, min(int(overlap), size // 2))
+    pieces, start_pos, total = [], 0, len(content)
+    while start_pos < total:
+        remaining = total - start_pos
+        if remaining <= size:
+            tail = content[start_pos:].strip()
+            if tail:
+                pieces.append(tail)
+            break
+        if remaining <= (2 * size - overlap):
+            first_len = min(size, max(overlap + 1, (remaining + overlap + 1) // 2))
+            raw_end = start_pos + first_len
+        else:
+            raw_end = start_pos + size
+        window = content[start_pos:raw_end]
+        min_boundary = max(1, int(len(window) * 0.72))
+        candidates = []
+        for pattern in ("\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " "):
+            pos = window.rfind(pattern, min_boundary)
+            if pos >= 0:
+                candidates.append(pos + len(pattern))
+        end_pos = start_pos + (max(candidates) if candidates else len(window))
+        piece = content[start_pos:end_pos].strip()
+        if piece:
+            pieces.append(piece)
+        start_pos = max(start_pos + 1, end_pos - overlap)
+        while start_pos < end_pos and content[start_pos].isspace():
+            start_pos += 1
+    return pieces
+
+
+def quick_file_fingerprint(path, block_size=1048576):
+    """Efficient move-detection fingerprint: size plus SHA-256 of head and tail."""
+    path = Path(path)
+    stat = path.stat()
+    digest = hashlib.sha256()
+    digest.update(str(stat.st_size).encode("ascii"))
+    with path.open("rb") as stream:
+        digest.update(stream.read(block_size))
+        if stat.st_size > block_size:
+            stream.seek(max(0, stat.st_size - block_size))
+            digest.update(stream.read(block_size))
+    return digest.hexdigest()
+
+
+def snapshot_document_id(path, fingerprint=None):
+    path = Path(path)
+    fingerprint = fingerprint or quick_file_fingerprint(path)
+    return hashlib.sha256((path.name.lower() + "|" + fingerprint).encode("utf-8", "replace")).hexdigest()
+
+
+def load_snapshot_manifest():
+    value = load(SNAPSHOT_MANIFEST_FILE, {"version": 1, "documents": {}})
+    if not isinstance(value, dict):
+        value = {"version": 1, "documents": {}}
+    value.setdefault("version", 1)
+    value.setdefault("documents", {})
+    return value
+
+
+def save_document_snapshot(path, source_root, extracted_text=None, manifest=None):
+    """Persist compressed full extracted text and identity metadata for fallback use."""
+    path = Path(path).resolve()
+    source_root = Path(source_root).resolve()
+    stat = path.stat()
+    fingerprint = quick_file_fingerprint(path)
+    document_id = snapshot_document_id(path, fingerprint)
+    snapshot_path = SNAPSHOT_DIR / f"{document_id}.txt.gz"
+    if extracted_text is None:
+        extracted_text = extract_full_document_text(path)
+    extracted_text = str(extracted_text or "").replace("\x00", "").strip()
+    tmp = snapshot_path.with_suffix(snapshot_path.suffix + ".tmp")
+    with gzip.open(tmp, "wt", encoding="utf-8", errors="replace") as stream:
+        stream.write(extracted_text)
+    os.replace(tmp, snapshot_path)
+    try:
+        relative = str(path.relative_to(source_root))
+    except ValueError:
+        relative = path.name
+    record = {
+        "document_id": document_id, "filename": path.name,
+        "original_path": str(path), "relative_path": relative,
+        "size": stat.st_size, "modified_ns": stat.st_mtime_ns,
+        "fingerprint": fingerprint, "snapshot": str(snapshot_path),
+        "snapshot_chars": len(extracted_text),
+        "snapshot_created": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "current_path": str(path), "status": "available",
+    }
+    if manifest is None:
+        with SNAPSHOT_MANIFEST_LOCK:
+            manifest = load_snapshot_manifest()
+            manifest["documents"][document_id] = record
+            save_json(SNAPSHOT_MANIFEST_FILE, manifest)
+    else:
+        manifest["documents"][document_id] = record
+    return record
+
+
+def read_document_snapshot(document_id):
+    with SNAPSHOT_MANIFEST_LOCK:
+        record = load_snapshot_manifest().get("documents", {}).get(str(document_id), {})
+    if not record:
+        raise FileNotFoundError("No extracted-text snapshot is available for this evidence.")
+    snapshot = Path(record.get("snapshot", ""))
+    if not snapshot.is_file():
+        raise FileNotFoundError("The extracted-text snapshot file is missing.")
+    with gzip.open(snapshot, "rt", encoding="utf-8", errors="replace") as stream:
+        return stream.read(), record
+
+
+def locate_snapshot_document(document_id, search_root):
+    """Search a replacement root and report exact, missing and discrepant structure."""
+    search_root = Path(search_root).expanduser().resolve(strict=True)
+    if not search_root.is_dir():
+        raise ValueError("The replacement path is not a folder.")
+    with SNAPSHOT_MANIFEST_LOCK:
+        manifest = load_snapshot_manifest()
+        record = manifest.get("documents", {}).get(str(document_id), {})
+    if not record:
+        raise FileNotFoundError("Document identity is not present in the snapshot manifest.")
+    expected_relative = Path(record.get("relative_path") or record.get("filename") or "")
+    candidates, discrepancies = [], []
+    direct = search_root / expected_relative
+    paths = []
+    if direct.is_file():
+        paths.append(direct)
+    filename = record.get("filename", "")
+    if filename:
+        try:
+            paths.extend(p for p in search_root.rglob(filename) if p.is_file() and p not in paths)
+        except OSError as exc:
+            discrepancies.append(f"Folder scan error: {exc}")
+    for candidate in paths[:500]:
+        try:
+            stat = candidate.stat()
+            size_match = int(record.get("size", -1)) == stat.st_size
+            fingerprint = quick_file_fingerprint(candidate) if size_match else ""
+            fingerprint_match = bool(fingerprint and fingerprint == record.get("fingerprint"))
+            item = {"path": str(candidate), "relative_path": str(candidate.relative_to(search_root)),
+                    "size": stat.st_size, "size_match": size_match,
+                    "fingerprint_match": fingerprint_match,
+                    "structure_match": candidate == direct}
+            candidates.append(item)
+            if not fingerprint_match:
+                discrepancies.append(f"Different content: {item['relative_path']}")
+        except OSError as exc:
+            discrepancies.append(f"Unreadable candidate {candidate}: {exc}")
+    exact = next((item for item in candidates if item["fingerprint_match"]), None)
+    if exact:
+        with SNAPSHOT_MANIFEST_LOCK:
+            manifest = load_snapshot_manifest()
+            current = manifest["documents"].get(str(document_id), record)
+            current["current_path"] = exact["path"]
+            current["status"] = "relocated"
+            current["relocated_root"] = str(search_root)
+            current["relocated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            manifest["documents"][str(document_id)] = current
+            save_json(SNAPSHOT_MANIFEST_FILE, manifest)
+    return {"document_id": document_id, "search_root": str(search_root),
+            "expected_relative_path": str(expected_relative), "exact_match": exact,
+            "candidates": candidates, "discrepancies": discrepancies,
+            "missing_expected_path": not direct.is_file()}
+
+
+def extract_full_document_text(path):
+    """Extract the complete readable text of one source document on demand."""
+    path = Path(path)
+    ext = path.suffix.lower()
+    if ext in (".txt", ".md", ".csv"):
+        return path.read_text(encoding="utf-8", errors="replace")
+    if ext in (".json", ".jsonl"):
+        return "\n".join(line for _, _, line in read_json_lines(path))
+    if ext == ".pdf":
+        return read_pdf(path)
+    if ext == ".docx":
+        return read_docx(path)
+    if ext == ".doc":
+        return read_legacy_doc(path)
+    if ext == ".pptx":
+        return "\n\n".join(f"[{section}]\n{content}" for section, _, content in read_pptx(path))
+    if ext in (".xlsx", ".xlsm"):
+        return "\n".join(f"[{sheet} row {row}] {line}" for sheet, row, line in read_xlsx(path))
+    if ext == ".xls":
+        return "\n".join(f"[{sheet} row {row}] {line}" for sheet, row, line in read_legacy_xls(path))
+    if ext == ".msg":
+        return read_msg(path)
+    raise RuntimeError(f"Full-document text preview is not supported for {ext or 'this file type'}.")
+
+
+def cached_full_document_text(path):
+    """Return full extracted text, cached by absolute path, size and mtime."""
+    path = Path(path).resolve(strict=True)
+    stat = path.stat()
+    key = (str(path).lower() if os.name == "nt" else str(path), stat.st_size, stat.st_mtime_ns)
+    with _DOCUMENT_TEXT_CACHE_LOCK:
+        cached = _DOCUMENT_TEXT_CACHE.get(key)
+        if cached is not None:
+            cached["used"] = time.time()
+            return cached["text"], True
+    extracted = extract_full_document_text(path)
+    extracted = str(extracted or "").replace("\x00", "").strip()
+    with _DOCUMENT_TEXT_CACHE_LOCK:
+        # Remove older signatures for the same file, then evict least recently used.
+        for old_key in list(_DOCUMENT_TEXT_CACHE):
+            if old_key[0] == key[0] and old_key != key:
+                _DOCUMENT_TEXT_CACHE.pop(old_key, None)
+        _DOCUMENT_TEXT_CACHE[key] = {"text": extracted, "used": time.time()}
+        while len(_DOCUMENT_TEXT_CACHE) > DOCUMENT_TEXT_CACHE_LIMIT:
+            oldest = min(_DOCUMENT_TEXT_CACHE, key=lambda k: _DOCUMENT_TEXT_CACHE[k]["used"])
+            _DOCUMENT_TEXT_CACHE.pop(oldest, None)
+    return extracted, False
+
+
+def safe_source_document(requested):
+    """Resolve a requested source path and restrict it to the configured source tree."""
+    target = Path(requested).expanduser().resolve(strict=True)
+    source_root = Path(settings()["source_folder"]).expanduser().resolve(strict=True)
+    try:
+        target.relative_to(source_root)
+    except ValueError as exc:
+        raise PermissionError("The requested file is outside the configured source folder.") from exc
+    if not target.is_file():
+        raise FileNotFoundError("Original document no longer exists.")
+    return target
+
+
 def chunks_for(path, config):
     ext = path.suffix.lower()
     source = path.name
     if ext in (".txt", ".md", ".csv"):
         units = [("Text", None, path.read_text(encoding="utf-8", errors="replace"))]
+    elif ext in (".json", ".jsonl"):
+        units = list(read_json_lines(path))
+    elif ext == ".doc":
+        units = [("Legacy Word document", None, read_legacy_doc(path))]
     elif ext == ".docx":
         units = [("Document", None, read_docx(path))]
+    elif ext == ".pptx":
+        units = list(read_pptx(path))
+    elif ext == ".msg":
+        units = [("Outlook message", None, read_msg(path))]
+    elif ext == ".xls":
+        raw_units = list(read_legacy_xls(path))
+        units = raw_units
     elif ext in (".xlsx", ".xlsm"):
         raw_units = list(read_xlsx(path))
         units = []
@@ -624,36 +1094,23 @@ def chunks_for(path, config):
             limit = positive(config.get("max_row_chars"), 5000, 100, 50000)
             out.append({
                 "id": str(uuid.uuid4()), "source": source, "path": str(path),
-                "section": section, "row": row, "text": content[:limit],
+                "section": section, "row": row, "chunk": 0,
+                "chunk_number": 1, "chunk_count": 1,
+                "chunk_chars": len(content[:limit]), "unit_chars": len(content),
+                "configured_chunk_size": positive(config.get("chunk_size"), 900, 200, 12000),
+                "text": content[:limit],
             })
             continue
-        size = positive(config.get("chunk_size"), 900, 200, 4000)
+        size = positive(config.get("chunk_size"), 900, 200, 12000)
         overlap = min(positive(config.get("chunk_overlap"), 140, 0, size - 1), size // 2)
-        sentences = re.split(r"\n{2,}|(?<=[.!?])\s+", content)
-        pieces, current = [], ""
-        for sentence in sentences:
-            sentence = sentence.strip()
-            if not sentence:
-                continue
-            if current and len(current) + len(sentence) + 1 > size:
-                pieces.append(current)
-                current = (current[-overlap:] + " " if overlap else "") + sentence
-            elif len(sentence) > size:
-                if current:
-                    pieces.append(current)
-                    current = ""
-                for start in range(0, len(sentence), size - overlap or size):
-                    piece = sentence[start:start + size]
-                    if piece:
-                        pieces.append(piece)
-            else:
-                current = f"{current} {sentence}".strip()
-        if current:
-            pieces.append(current)
+        pieces = split_text_chunks(content, size, overlap)
         for position, piece in enumerate(pieces):
             out.append({
                 "id": str(uuid.uuid4()), "source": source, "path": str(path),
-                "section": section, "row": None, "chunk": position, "text": piece,
+                "section": section, "row": row, "chunk": position,
+                "chunk_number": position + 1, "chunk_count": len(pieces),
+                "chunk_chars": len(piece), "unit_chars": len(content),
+                "configured_chunk_size": size, "text": piece,
             })
     return out
 
@@ -667,7 +1124,7 @@ def openai_base(config):
 
 
 def api(config, endpoint, body=None, timeout=120):
-    data = None if body is None else json.dumps(body).encode()
+    data = None if body is None else json.dumps(json_safe(body)).encode()
     req = urllib.request.Request(openai_base(config) + endpoint, data, {"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as response:
         return json.load(response)
@@ -675,15 +1132,15 @@ def api(config, endpoint, body=None, timeout=120):
 
 def lmstudio_api(config, endpoint, body=None, timeout=5):
     base = openai_base(config)[:-3].rstrip("/")
-    data = None if body is None else json.dumps(body).encode()
+    data = None if body is None else json.dumps(json_safe(body)).encode()
     req = urllib.request.Request(base + endpoint, data, {"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as response:
         return json.load(response)
 
 
-def local_api(url, endpoint, body):
-    req = urllib.request.Request(url + endpoint, json.dumps(body).encode(), {"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=120) as response:
+def local_api(url, endpoint, body, timeout=120):
+    req = urllib.request.Request(url + endpoint, json.dumps(json_safe(body)).encode(), {"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as response:
         return json.load(response)
 
 
@@ -716,29 +1173,94 @@ def analysis_model_for(config):
     return (config.get("analysis_model") or "").strip() or (config.get("chat_model") or "").strip()
 
 
-def embed(config, inputs):
-    def one(item):
+def embed(config, inputs, tolerate_errors=False, on_progress=None):
+    """Create normalized vectors with bounded waits and optional live heartbeat events."""
+    ctx = EMBED_SERVER.eff_ctx or EMBED_SERVER.nominal_ctx or 2048
+    max_chars = max(200, model_max_chars(ctx, "embedding"))
+    request_timeout = positive(config.get("embedding_request_timeout"), 90, 15, 600)
+    heartbeat_seconds = positive(config.get("embedding_heartbeat_seconds"), 5, 2, 60)
+
+    def notify(event, **detail):
+        if on_progress:
+            try:
+                on_progress({"event": event, **detail})
+            except Exception:
+                pass
+
+    def request_vector(content, item_number):
+        box = {}
+        started = time.time()
+        def runner():
+            try:
+                box["value"] = local_api(
+                    EMBEDDING_URL, "/embedding",
+                    {"content": content, "truncate": True},
+                    timeout=request_timeout,
+                )
+            except BaseException as exc:
+                box["error"] = exc
+        worker = threading.Thread(target=runner, daemon=True,
+                                  name=f"embedding-request-{item_number}")
+        worker.start()
+        while worker.is_alive():
+            worker.join(heartbeat_seconds)
+            if worker.is_alive():
+                notify("heartbeat", item=item_number, elapsed=int(time.time() - started),
+                       backend="CPU" if EMBED_SERVER.gpu_layers == 0 else detect_gpu_backend().upper(),
+                       message=f"Embedding passage {item_number} is still running")
+        if "error" in box:
+            raise box["error"]
+        return box.get("value")
+
+    def one(number_item):
+        number, item = number_item
+        item = item[:max_chars]
         cached = _EMBED_CACHE.get(item)
         if cached is not None:
+            notify("cached", item=number)
             return cached
-        data = local_api(EMBEDDING_URL, "/embedding", {"content": item, "truncate": True})
-        entry = data[0] if isinstance(data, list) else data["value"][0]
-        value = entry["embedding"] if isinstance(entry, dict) else entry
-        if isinstance(value, list) and value and isinstance(value[0], list):
-            value = value[0]
-        vector = [float(x) for x in value.split()] if isinstance(value, str) else value
-        magnitude = math.sqrt(sum(x * x for x in vector)) or 1.0
-        vector = [x / magnitude for x in vector]
-        if len(_EMBED_CACHE) > 4096:
-            _EMBED_CACHE.clear()
-        _EMBED_CACHE[item] = vector
-        return vector
+        last_exc = None
+        attempt = item[:min(len(item), max_chars, max(256, int(ctx * 0.88)))]
+        # Only shrink/retry for an actual context/token overflow. Timeouts, refused
+        # connections and server failures return immediately during tolerant ingestion.
+        for retry in range(4):
+            try:
+                notify("start", item=number, chars=len(attempt), retry=retry)
+                data = request_vector(attempt, number)
+                entry = data[0] if isinstance(data, list) else data["value"][0]
+                value = entry["embedding"] if isinstance(entry, dict) else entry
+                if isinstance(value, list) and value and isinstance(value[0], list):
+                    value = value[0]
+                vector = [float(x) for x in value.split()] if isinstance(value, str) else value
+                if not vector:
+                    raise RuntimeError("embedding server returned an empty vector")
+                magnitude = math.sqrt(sum(x * x for x in vector)) or 1.0
+                vector = [x / magnitude for x in vector]
+                if len(_EMBED_CACHE) > 4096:
+                    _EMBED_CACHE.clear()
+                _EMBED_CACHE[item] = vector
+                notify("done", item=number, dimensions=len(vector))
+                return vector
+            except Exception as exc:
+                last_exc = exc
+                msg = str(exc).lower()
+                overflow = any(x in msg for x in ("context", "token", "too long", "exceed", "n_batch"))
+                notify("retry" if overflow else "error", item=number, retry=retry,
+                       error=f"{type(exc).__name__}: {exc}")
+                if not overflow or len(attempt) <= 256:
+                    break
+                attempt = attempt[:max(256, len(attempt) // 2)]
+        if tolerate_errors:
+            return None
+        raise last_exc or RuntimeError("embedding failed")
 
-
-    if len(inputs) < 2:
-        return [one(item) for item in inputs]
-    with ThreadPoolExecutor(max_workers=HARDWARE["embedding_workers"]) as pool:
-        return list(pool.map(one, inputs))
+    workers = positive(config.get("embedding_workers"), 1, 1, 16)
+    workers = min(workers, positive(config.get("local_server_parallel"), 1, 1, 16))
+    numbered = list(enumerate(inputs, 1))
+    if len(inputs) < 2 or workers == 1:
+        return [one(pair) for pair in numbered]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(one, numbered))
 
 
 def cosine(a, b):
@@ -860,7 +1382,7 @@ def retrieve(query, config, excluded=None, rerank=True):
             import numpy as np
             db = lancedb.connect(str(DATA / "lancedb"))
             table = db.open_table("chunks")
-            query_vec = np.array(vector, dtype=np.float32)
+            query_vec = [float(x) for x in vector]
             results = table.search(query_vec).metric("cosine").limit(top_k).to_list()
             id_to_idx = {c["id"]: i for i, c in enumerate(corpus)}
             for r in results:
@@ -901,7 +1423,7 @@ def retrieve(query, config, excluded=None, rerank=True):
         chunk = corpus[idx]
         if chunk.get("id") in excluded:
             continue
-        item = dict(chunk)
+        item = {k: v for k, v in chunk.items() if k != "_vec_buf"}
         item["_score"] = fused[idx]
         item["_semantic_score"] = semantic_scores.get(idx, 0)
         result.append(item)
@@ -982,7 +1504,7 @@ def chat_stream(config, messages, tokens, on_delta, model=None):
     }
     request = urllib.request.Request(
         openai_base(config) + "/chat/completions",
-        json.dumps(body).encode(),
+        json.dumps(json_safe(body)).encode(),
         {"Content-Type": "application/json", "Accept": "text/event-stream"},
     )
     output = []
@@ -1114,16 +1636,19 @@ def analyze_passage(config, query, item, on_delta=None, model=None):
         else:
             raw_text = chat(config, messages, 300, model=model)
         summary, tag = _parse_analysis(raw_text)
-        return summary, tag, (raw_text or "").strip()
+        return summary, tag, (raw_text or "").strip(), ""
     except Exception as exc:
+        # Keep transport/model errors out of the evidence preview. When analysis is
+        # unavailable, show a clean excerpt of the actual source passage and expose
+        # the technical problem separately to Telemetry/UI metadata.
         streamed = (raw_text or "").strip()
-        fallback = streamed or item.get("text", "")[:600]
         if streamed:
-            summary, tag = _parse_analysis(fallback)
+            summary, tag = _parse_analysis(streamed)
         else:
-            summary = f"(analysis call failed: {exc}) passage begins: {item.get('text', '')[:300]}"
+            source_text = text(item.get("text", ""))
+            summary = source_text[:600] or "Source passage is empty."
             tag = "RELATED"
-        return summary, tag, streamed
+        return summary, tag, streamed, str(exc)
 
 
 # --------------------------------------------------------------------------- #
@@ -1263,6 +1788,335 @@ def _citation_numbers(answer):
     """Sorted distinct source numbers the answer actually cites, e.g. [1, 3]."""
     return sorted({int(m) for m in re.findall(r"\[(\d+)\]", answer)})
 
+
+# --------------------------------------------------------------------------- #
+# Outlook PST ingestion (Windows / Outlook COM)
+# --------------------------------------------------------------------------- #
+PST_JOBS = {}
+PST_JOBS_LOCK = threading.Lock()
+
+PST_DEPENDENCIES = {
+    "win32com.client": "pywin32",
+    "pythoncom": "pywin32",
+    "rapidfuzz": "rapidfuzz",
+    "extract_msg": "extract-msg",
+    "openpyxl": "openpyxl",
+    "docx": "python-docx",
+    "pypdf": "pypdf",
+}
+
+def pst_dependency_report():
+    import importlib.util
+    missing = []
+    for module, package in PST_DEPENDENCIES.items():
+        if importlib.util.find_spec(module) is None:
+            missing.append({"module": module, "package": package,
+                            "install": f"{sys.executable} -m pip install {package}"})
+    required = [m for m in missing if m["module"] in ("win32com.client", "pythoncom")]
+    return {"platform": sys.platform, "outlook_com_supported": os.name == "nt",
+            "missing": missing, "required_missing": required,
+            "install_all": (f"{sys.executable} -m pip install " +
+                            " ".join(sorted({m['package'] for m in missing}))) if missing else ""}
+
+def _pst_norm_name(filename):
+    stem, ext = os.path.splitext(os.path.basename(str(filename or "")))
+    stem = re.sub(r"(?i)(?:[ _.-]*(?:copy|duplicate))(?:[ _.-]*\\?\d+\\?)?$", "", stem)
+    stem = re.sub(r"(?:[ _.-]*\\(\d+\\)|[ _.-]+\d+)$", "", stem)
+    return re.sub(r"[^a-z0-9]+", " ", stem.lower()).strip(), ext.lower()
+
+def _pst_similarity(a, b):
+    try:
+        from rapidfuzz import fuzz
+        return int(fuzz.ratio(a, b))
+    except ImportError:
+        return int(round(100 * SequenceMatcher(None, a, b).ratio()))
+
+def _pst_safe_name(value, limit=90):
+    value = re.sub(r'[\\/:*?"<>|]+', '_', str(value or 'No Subject')).strip(' ._')
+    return (value[:limit] or 'No Subject')
+
+def _pst_attachment_text(path):
+    ext = path.suffix.lower()
+    try:
+        if ext == '.pdf': return read_pdf(path)
+        if ext == '.docx': return read_docx(path)
+        if ext in ('.xlsx', '.xlsm'):
+            return '\n'.join(f"{sheet} row {row}: {line}" for sheet, row, line in read_xlsx(path))
+        if ext == '.msg':
+            try:
+                import extract_msg
+            except ImportError as exc:
+                raise RuntimeError(f"Missing dependency 'extract-msg'. Install with: {sys.executable} -m pip install extract-msg") from exc
+            msg = extract_msg.Message(str(path))
+            try:
+                return f"Subject: {msg.subject or ''}\nFrom: {msg.sender or ''}\nTo: {msg.to or ''}\nDate: {msg.date or ''}\n\n{msg.body or ''}"
+            finally:
+                msg.close()
+    except Exception as exc:
+        return f"[Attachment extraction error: {path.name}: {exc}]"
+    return ""
+
+def import_pst_to_source(pst_path, config, progress=None):
+    if os.name != 'nt':
+        raise RuntimeError("PST import through Outlook requires Windows and desktop Outlook.")
+    report = pst_dependency_report()
+    if report['required_missing']:
+        raise RuntimeError("Missing Outlook dependency. Install with: " + report['install_all'])
+    try:
+        import pythoncom
+        import win32com.client
+    except ImportError as exc:
+        raise RuntimeError(f"Missing dependency '{exc.name}'. Install with: {sys.executable} -m pip install pywin32") from exc
+    pst = Path(pst_path).expanduser().resolve()
+    if not pst.is_file() or pst.suffix.lower() != '.pst':
+        raise ValueError("Enter an existing .pst file path.")
+    threshold = positive(config.get('pst_similarity_threshold'), 90, 50, 100)
+    allowed = {x.strip().lower() for x in str(config.get('pst_attachment_extensions','')).split(',') if x.strip()}
+    processing_mode = str(config.get('pst_processing_mode', 'emails_only') or 'emails_only').strip().lower()
+    if processing_mode not in ('emails_only', 'attachments_only', 'emails_and_attachments'):
+        processing_mode = 'emails_only'
+    include_email_text = processing_mode in ('emails_only', 'emails_and_attachments')
+    extract_atts = processing_mode in ('attachments_only', 'emails_and_attachments') and bool(config.get('pst_extract_attachments', True))
+    if progress:
+        progress('PST mode: ' + {'emails_only':'emails first (attachments skipped)', 'attachments_only':'attachments only', 'emails_and_attachments':'emails and attachments'}[processing_mode], 2)
+    mode_suffix = {'emails_only':'emails', 'attachments_only':'attachments', 'emails_and_attachments':'combined'}[processing_mode]
+    output = Path(config['source_folder']) / '.pst_extracted' / (_pst_safe_name(pst.stem) + '_' + hashlib.sha1(str(pst).encode()).hexdigest()[:8] + '_' + mode_suffix)
+    if output.exists(): shutil.rmtree(output)
+    output.mkdir(parents=True, exist_ok=True)
+    if progress: progress('Connecting to Outlook...', 3)
+    pythoncom.CoInitialize()
+    if progress: progress('COM initialised. Creating Outlook.Application...', 4)
+    ns = None
+    added = False
+    try:
+        outlook = win32com.client.Dispatch('Outlook.Application')
+        if progress: progress('Outlook.Application connected. Requesting MAPI namespace...', 5)
+        ns = outlook.GetNamespace('MAPI')
+        if progress: progress('MAPI namespace ready. Enumerating Outlook stores...', 6)
+        existing = None
+        stores = ns.Stores
+        if progress: progress(f'Outlook reports {stores.Count} mounted store(s). Looking for target PST...', 7)
+        for store in stores:
+            try:
+                if store.FilePath and os.path.normcase(os.path.abspath(store.FilePath)) == os.path.normcase(str(pst)):
+                    existing = store; break
+            except Exception: pass
+        if existing is None:
+            if progress: progress('Mounting PST in Outlook...', 7)
+            if progress: progress(f'Calling Namespace.AddStore for: {pst}', 8)
+            ns.AddStore(str(pst)); added = True
+            if progress: progress('Namespace.AddStore returned. Locating mounted PST store...', 9)
+            for store in ns.Stores:
+                try:
+                    if store.FilePath and os.path.normcase(os.path.abspath(store.FilePath)) == os.path.normcase(str(pst)):
+                        existing = store; break
+                except Exception: pass
+        if existing is None: raise RuntimeError('Outlook mounted the PST but its store could not be located.')
+        if progress: progress('PST mounted. Reading folder tree...', 10)
+        root = existing.GetRootFolder()
+        conversations = {}
+        attachments = {}
+        stack=[root]; scanned=0
+        folder_count = 0
+        while stack:
+            folder=stack.pop(); folder_count += 1
+            if progress: progress(f"Scanning folder {folder_count}: {getattr(folder, 'Name', 'Unknown')}", min(75, 10 + folder_count))
+            try:
+                for sub in folder.Folders: stack.append(sub)
+            except Exception: pass
+            try:
+                items = folder.Items
+                item_count = int(items.Count or 0)
+            except Exception as exc:
+                if progress: progress(f"Skipped folder {folder_count}: could not read Items ({exc})", min(75, 10 + folder_count))
+                continue
+            folder_name = str(getattr(folder, 'Name', 'Unknown') or 'Unknown')
+            if progress: progress(f"Folder {folder_count}: {folder_name} contains {item_count} item(s). Starting indexed scan...", min(75, 10 + folder_count))
+            # Outlook's Python COM collection iterator can freeze on a large/corrupt PST folder.
+            # Indexed Items.Item(n) provides exact progress and identifies the item where COM blocks.
+            for item_index in range(1, item_count + 1):
+                if progress and (item_index == 1 or item_index % 10 == 0 or item_index == item_count):
+                    progress(f"Folder {folder_count}: {folder_name} — opening item {item_index}/{item_count}; total emails {scanned}",
+                             min(80, 12 + int(65 * item_index / max(1, item_count))))
+                try:
+                    mail = items.Item(item_index)
+                except Exception as exc:
+                    if progress: progress(f"Folder {folder_count}: {folder_name} — skipped unreadable item {item_index}/{item_count}: {exc}",
+                                           min(80, 12 + int(65 * item_index / max(1, item_count))))
+                    continue
+                try:
+                    item_class = getattr(mail, 'Class', 0)
+                    if item_class != 43:
+                        continue
+                    subject = str(getattr(mail, 'Subject', '') or 'No Subject')
+                    if progress:
+                        progress(f"Folder {folder_count}: {folder_name} — analysing email {item_index}/{item_count} | extracted {scanned} | {subject[:100]}",
+                                 min(80, 12 + int(65 * item_index / max(1, item_count))))
+                    conv = str(getattr(mail, 'ConversationID', '') or '').strip()
+                    if not conv:
+                        norm = re.sub(r'(?i)^(?:(?:re|fw|fwd):\s*)+', '', subject).strip().lower()
+                        conv = 'subject::' + norm
+                    received = getattr(mail, 'ReceivedTime', None)
+                    received_iso = received.strftime('%Y-%m-%d %H:%M:%S') if received else ''
+                    entry = {"subject": subject, "from": str(getattr(mail, 'SenderName', '') or ''),
+                             "to": str(getattr(mail, 'To', '') or ''), "cc": str(getattr(mail, 'CC', '') or ''),
+                             "received": received_iso, "received_obj": received,
+                             "body": str(getattr(mail, 'Body', '') or '') if include_email_text else '',
+                             "folder": str(getattr(folder, 'FolderPath', '') or '')}
+                    # Conversation metadata is kept in all modes so attachments remain traceable
+                    # to the originating email and Outlook ConversationID.
+                    conversations.setdefault(conv, []).append(entry)
+                    if extract_atts:
+                        try: count = mail.Attachments.Count
+                        except Exception: count = 0
+                        for i in range(1, count + 1):
+                            if progress: progress(f"Folder {folder_count}: {folder_name} — email {item_index}/{item_count}, attachment {i}/{count}",
+                                                   min(80, 12 + int(65 * item_index / max(1, item_count))))
+                            att = mail.Attachments.Item(i)
+                            name = str(att.FileName or f'attachment_{i}')
+                            stem, ext = _pst_norm_name(name)
+                            if ext not in allowed or not stem: continue
+                            keylist = attachments.setdefault(conv, []); match = None; best = 0
+                            for old in keylist:
+                                os_, oe = _pst_norm_name(old['name'])
+                                if oe != ext: continue
+                                score = _pst_similarity(stem, os_)
+                                if score > best: best = score; match = old
+                            # Save immediately; do not retain live Outlook COM Attachment proxies.
+                            saved = output / ('_pending_' + uuid.uuid4().hex + ext)
+                            att.SaveAsFile(str(saved))
+                            candidate = {"name": name, "received": received, "score": best,
+                                         "saved_path": str(saved), "subject": subject}
+                            if match is not None and best >= threshold:
+                                if received and (not match['received'] or received > match['received']):
+                                    try: Path(match.get('saved_path', '')).unlink(missing_ok=True)
+                                    except Exception: pass
+                                    keylist[keylist.index(match)] = candidate
+                                else:
+                                    saved.unlink(missing_ok=True)
+                            else:
+                                keylist.append(candidate)
+                    scanned += 1
+                except Exception as exc:
+                    print(f"[PST] Item processing error | folder={folder_name} item={item_index}/{item_count} | {type(exc).__name__}: {exc}", flush=True)
+                    continue
+            if progress:
+                progress(f"Completed folder {folder_count}: {folder_name} — inspected {item_count} item(s); total extracted emails {scanned}",
+                         min(80, 12 + folder_count))
+        if progress: progress(f'Found {scanned} emails in {len(conversations)} conversations. Writing conversation files...', 82)
+        written=0; att_count=0
+        for conv, emails in conversations.items():
+            emails.sort(key=lambda x: x['received_obj'] or datetime.min)
+            title=emails[-1]['subject'] if emails else 'No Subject'
+            fn=_pst_safe_name(title)+'__'+hashlib.sha1(conv.encode('utf-8','replace')).hexdigest()[:10]+'.txt'
+            parts=[f"PST PROCESSING MODE: {processing_mode}",f"CONVERSATION ID: {conv}",f"THREAD SUBJECT: {title}",f"EMAIL COUNT: {len(emails)}",'='*80]
+            if include_email_text:
+                for idx,e in enumerate(emails,1):
+                    parts += ['',f"EMAIL {idx}/{len(emails)}",f"SUBJECT: {e['subject']}",f"FROM: {e['from']}",
+                              f"TO: {e['to']}",f"CC: {e['cc']}",f"DATE: {e['received']}",f"SOURCE FOLDER: {e['folder']}",'-'*80,e['body']]
+            else:
+                parts += ['', 'EMAIL BODY EXTRACTION: skipped (attachments-only mode)',
+                          'Attachment records below retain their source email subject and received date.']
+            for idx,a in enumerate(attachments.get(conv,[]),1):
+                temp = Path(a['saved_path'])
+                try:
+                    content = _pst_attachment_text(temp)
+                    parts += ['',f"ATTACHMENT {idx} (latest fuzzy match)",f"FILENAME: {a['name']}",
+                              f"SOURCE EMAIL SUBJECT: {a.get('subject','')}",f"RECEIVED: {a['received']}",f"SIMILARITY SCORE: {a['score']}%",'-'*80,content]
+                    att_count += 1
+                finally:
+                    try: temp.unlink(missing_ok=True)
+                    except Exception: pass
+            (output/fn).write_text('\n'.join(parts),encoding='utf-8',errors='replace'); written+=1
+            if progress and written % 20 == 0: progress(f'Wrote {written}/{len(conversations)} conversations...', min(98, 82 + int(16 * written / max(1, len(conversations)))))
+        if progress: progress('PST extraction complete.', 100)
+        return {"emails":scanned,"conversations":len(conversations),"attachments":att_count,"files":written,"output":str(output),"threshold":threshold,"processing_mode":processing_mode}
+    finally:
+        if added and ns is not None:
+            try: ns.RemoveStore(existing.GetRootFolder())
+            except Exception: pass
+        pythoncom.CoUninitialize()
+
+def start_pst_job(pst_path, config):
+    job_id = uuid.uuid4().hex
+    now = time.time()
+    job = {"id": job_id, "state": "queued", "percent": 1,
+           "phase": "queued", "message": "Queued PST extraction...",
+           "created": now, "updated": now, "history": []}
+    pst_log_dir = DATA / "logs"
+    pst_log_dir.mkdir(parents=True, exist_ok=True)
+    pst_log_path = pst_log_dir / f"pst_{time.strftime('%Y%m%d_%H%M%S')}_{job_id[:8]}.log"
+    job["log_file"] = str(pst_log_path)
+    with PST_JOBS_LOCK:
+        PST_JOBS[job_id] = job
+
+    def write_log(line):
+        try:
+            with pst_log_path.open("a", encoding="utf-8") as stream:
+                stream.write(line + "\n")
+        except Exception:
+            pass
+
+    def update(message, percent=None):
+        stamp = time.time()
+        line = f"[PST {job_id[:8]}] {time.strftime('%H:%M:%S')} | {message}"
+        print(line, flush=True)
+        write_log(line)
+        with PST_JOBS_LOCK:
+            current = PST_JOBS.get(job_id, job)
+            current["state"] = "running"
+            current["phase"] = str(message).split("...", 1)[0]
+            current["message"] = str(message)
+            current["updated"] = stamp
+            current["history"] = (current.get("history", []) + [{"time": time.strftime('%H:%M:%S'), "message": str(message)}])[-250:]
+            current["events"] = int(current.get("events", 0)) + 1
+            if percent is not None:
+                current["percent"] = max(1, min(100, int(percent)))
+
+    def heartbeat():
+        warning_after = positive(config.get("pst_stall_warning_seconds"), 30, 10, 600)
+        while True:
+            time.sleep(5)
+            with PST_JOBS_LOCK:
+                current = PST_JOBS.get(job_id)
+                if not current or current.get("state") in ("done", "error"):
+                    return
+                idle = int(time.time() - current.get("updated", now))
+                elapsed = int(time.time() - current.get("created", now))
+                current["elapsed_seconds"] = elapsed
+                current["idle_seconds"] = idle
+                current["stalled"] = idle >= warning_after
+                phase = current.get("message", "unknown phase")
+            if idle >= warning_after:
+                if idle == warning_after or idle % 30 < 5:
+                    warning = f"[PST {job_id[:8]}] WARNING | No phase change for {idle}s. Current COM operation: {phase}"
+                    print(warning, flush=True); write_log(warning)
+            elif idle % 15 < 5:
+                beat = f"[PST {job_id[:8]}] heartbeat | elapsed={elapsed}s idle={idle}s | {phase}"
+                print(beat, flush=True); write_log(beat)
+
+    def worker():
+        try:
+            update("Starting Outlook PST extraction...", 2)
+            result = import_pst_to_source(pst_path, config, update)
+            with PST_JOBS_LOCK:
+                PST_JOBS[job_id].update({"state": "done", "percent": 100,
+                                         "updated": time.time(), "stalled": False,
+                                         "message": "PST extraction complete.", "result": result})
+            print(f"[PST {job_id[:8]}] DONE | {result}", flush=True)
+        except Exception as exc:
+            report = pst_dependency_report()
+            with PST_JOBS_LOCK:
+                PST_JOBS[job_id].update({"state": "error", "updated": time.time(),
+                                         "message": str(exc), "error": str(exc),
+                                         "dependency_help": report.get("install_all", ""),
+                                         "missing": report.get("missing", [])})
+            print(f"[PST {job_id[:8]}] ERROR | {type(exc).__name__}: {exc}", flush=True)
+
+    threading.Thread(target=heartbeat, daemon=True, name=f"pst-heartbeat-{job_id[:8]}").start()
+    threading.Thread(target=worker, daemon=True, name=f"pst-import-{job_id[:8]}").start()
+    return job
+
 # --------------------------------------------------------------------------- #
 #  HTTP handler
 # --------------------------------------------------------------------------- #
@@ -1278,7 +2132,7 @@ class Handler(SimpleHTTPRequestHandler):
         super().end_headers()
 
     def send_json(self, data, status=200):
-        raw = json.dumps(data, ensure_ascii=False).encode()
+        raw = json.dumps(json_safe(data), ensure_ascii=False).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
@@ -1309,7 +2163,7 @@ class Handler(SimpleHTTPRequestHandler):
         if getattr(self, "_gone", False):
             return
         try:
-            payload = json.dumps(data, ensure_ascii=False)
+            payload = json.dumps(json_safe(data), ensure_ascii=False)
             self.wfile.write(f"data: {payload}\n".encode("utf-8"))
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):
@@ -1319,13 +2173,17 @@ class Handler(SimpleHTTPRequestHandler):
     def _log(self, message, level="info"):
         self.send_stream({"type": "log", "text": message, "level": level, "t": time.strftime("%H:%M:%S")})
 
-    def _stage(self, stage_id, status):
+    def _stage(self, stage_id, status, elapsed=None):
+        """Emit a stage event; elapsed may be supplied by measured fast paths."""
         now = time.time()
         payload = {"type": "stage", "id": stage_id, "status": status}
         if status == "active":
             self._stage_t[stage_id] = now
-        elif status == "done" and stage_id in self._stage_t:
-            payload["elapsed"] = round(now - self._stage_t[stage_id], 2)
+        elif status == "done":
+            if elapsed is not None:
+                payload["elapsed"] = round(float(elapsed), 3)
+            elif stage_id in self._stage_t:
+                payload["elapsed"] = round(now - self._stage_t[stage_id], 2)
         self.send_stream(payload)
 
     def pulse_while(self, fn, interval=0.7):
@@ -1356,12 +2214,66 @@ class Handler(SimpleHTTPRequestHandler):
 
         answer_model = (c.get("chat_model") or "").strip()
         a_model = analysis_model_for(c)        
-        have_analysis = bool(a_model)
+        # Query planning and passage analysis are independently controllable.
+        # Evidence-only mode must never summarize/check chunks with an LLM.
+        can_rewrite = bool(a_model) and bool(c.get("use_query_rewrite", True))
+        have_analysis = bool(a_model) and not evidence_only
 
         self.send_stream({"type": "run_start", "evidence_only": evidence_only,
                           "want_answer": want_answer, "adaptive": adaptive,
                           "analysis_model": a_model, "answer_model": answer_model})
         try:
+            # Fast retrieval-only path: no LM Studio, query rewrite, HyDE,
+            # passage analysis, sufficiency checks, or answer generation.
+            # It uses the same hybrid semantic + BM25 retrieval and optional
+            # local BGE reranker as the full pipeline, preserving retrieval quality.
+            if evidence_only:
+                stage = "retrieve"
+                self._stage("understand", "skipped")
+                self._stage("retrieve", "active")
+                self._stage("analyze", "skipped")
+                started = time.perf_counter()
+                results, error = retrieve(query, c, rerank=True)
+                if error:
+                    raise RuntimeError(error)
+                elapsed_ms = (time.perf_counter() - started) * 1000.0
+                limited = results[:positive(c.get("max_candidate_checks"), 24, 4, 200)]
+                self.send_stream({"type": "retrieve_progress", "index": 1, "total": 1,
+                                  "variant": query, "hits": len(results)})
+                for number, item in enumerate(limited, 1):
+                    meta = {
+                        "number": number, "total": len(limited),
+                        "source": item.get("source", ""),
+                        "section": item.get("section") or f"Passage {(item.get('chunk') or 0) + 1}",
+                        "row": item.get("row"), "path": item.get("path", ""),
+                        "document_id": item.get("document_id", ""),
+                        "snapshot_available": bool(item.get("snapshot_available") or item.get("document_id")),
+                        "chunk_number": item.get("chunk_number", (item.get("chunk") or 0) + 1),
+                        "chunk_count": item.get("chunk_count"),
+                        "unit_chars": item.get("unit_chars"),
+                        "configured_chunk_size": item.get("configured_chunk_size"),
+                        "semantic": round(float(item.get("_semantic_score", 0)), 3),
+                        "score": round(float(item.get("_score", 0)), 4),
+                    }
+                    self.send_stream({
+                        "type": "verify_done", **meta, "accepted": True,
+                        "relevance": "RAW", "verdict": "RAW EVIDENCE - NO LLM / LM STUDIO",
+                        "reason": "retrieval only", "fact": item.get("text", ""),
+                        "parsed": item.get("text", ""), "raw": "",
+                        "full_text": item.get("text", ""), "analysis_error": "",
+                        "raw_evidence": True, "elapsed": 0,
+                        "accepted_count": number, "target": len(limited),
+                    })
+                self.send_stream({"type": "sources", "results": [
+                    {"number": n, **public(item)}
+                    for n, item in enumerate(limited, 1)
+                ]})
+                self._stage("retrieve", "done", round(elapsed_ms / 1000.0, 3))
+                self._stage("answer", "skipped")
+                self._log(f"Retrieval-only: {len(limited)} chunks in {elapsed_ms:.1f} ms; no LLM/LM Studio calls.", "ok")
+                self.send_stream({"type": "done", "elapsed": round(time.time() - t0, 3),
+                                  "retrieval_ms": round(elapsed_ms, 1)})
+                return
             checkpoint = positive(c.get("rerank_count"), 4, 1, 30)
             max_checks = positive(c.get("max_candidate_checks"), 24, 4, 200)
             base_candidates = positive(c.get("candidate_count"), 32, 4, 400)
@@ -1371,9 +2283,10 @@ class Handler(SimpleHTTPRequestHandler):
 
             # ---- 01 understand (analysis model) ----
             self._stage("understand", "active")
-            if not adaptive or not have_analysis:
+            if not adaptive or not can_rewrite:
                 plan = {"rewrite": query, "variants": [query], "retrieve": True, "is_greeting": False}
-                self._log("Adaptive planning off — using the raw question for retrieval.")
+                reason = "disabled in Settings" if not c.get("use_query_rewrite", True) else "adaptive planning unavailable"
+                self._log(f"LLM query rewrite {reason} — using the exact user question for retrieval.")
             else:
                 self._log("Planning retrieval — asking the analysis model for a rewrite + HyDE variants...")
                 plan = self.pulse_while(lambda: understand_query(c, query, model=a_model))
@@ -1446,25 +2359,38 @@ class Handler(SimpleHTTPRequestHandler):
                         "number": checks_done, "total": max_checks,
                         "source": item.get("source", ""),
                         "section": item.get("section") or f"Passage {(item.get('chunk') or 0) + 1}",
-                        "row": item.get("row"),
+                        "row": item.get("row"), "path": item.get("path", ""),
+                        "document_id": item.get("document_id", ""),
+                        "snapshot_available": bool(item.get("snapshot_available") or item.get("document_id")),
+                        "chunk_number": item.get("chunk_number", (item.get("chunk") or 0) + 1),
+                        "chunk_count": item.get("chunk_count"),
+                        "unit_chars": item.get("unit_chars"),
+                        "configured_chunk_size": item.get("configured_chunk_size"),
                         "semantic": round(float(item.get("_semantic_score", 0)), 3),
                         "score": round(float(item.get("_score", 0)), 4),
                     }
                     self.send_stream({"type": "verify_start", **meta})
                     t_check = time.time()
                     if not have_analysis:
-                        summary, tag, raw_text = item["text"][:1600], "RELATED", item["text"][:1600]
+                        # Return the complete retrieved source chunk directly. No LLM call,
+                        # summary, relevance classification, or sufficiency assessment.
+                        summary, tag, raw_text, analysis_error = item["text"], "RAW", "", ""
                     else:
                         self._log(f"[{checks_done}] analysing {meta['source']} ({meta['section']})...")
                         n = checks_done
-                        summary, tag, raw_text = analyze_passage(
+                        summary, tag, raw_text, analysis_error = analyze_passage(
                             c, query, item,
                             lambda d, num=n: self.send_stream({"type": "verify_delta", "number": num, "text": d}),
                             model=a_model)
+                        if analysis_error:
+                            self._log(f"[{checks_done}] analysis unavailable for {meta['source']}: {analysis_error}", "warn")
                     entry = {**meta, "summary": summary, "raw": raw_text, "relevance": tag,
-                             "text": summary, "path": item.get("path", "")}
+                             "text": summary, "path": item.get("path", ""),
+                             "document_id": item.get("document_id", ""),
+                             "snapshot_available": bool(item.get("snapshot_available") or item.get("document_id"))}
                     analyzed.append(entry)
-                    verdict = f"ANALYZED · [{tag}] {REL_LABEL.get(tag, '')}"
+                    verdict = ("RAW EVIDENCE · no LLM analysis" if tag == "RAW"
+                               else f"ANALYZED · [{tag}] {REL_LABEL.get(tag, '')}")
                     self._log(
                         f"[{checks_done}] {meta['source']} → kept [{tag}] "
                         f"({round(time.time() - t_check, 1)}s, {len(analyzed)} note(s) held)",
@@ -1479,6 +2405,9 @@ class Handler(SimpleHTTPRequestHandler):
                         "fact": summary,
                         "parsed": summary,
                         "raw": raw_text,
+                        "full_text": item.get("text", ""),
+                        "analysis_error": analysis_error,
+                        "raw_evidence": tag == "RAW",
                         "elapsed": round(time.time() - t_check, 2),
                         "accepted_count": len(analyzed),
                         "target": checkpoint,
@@ -1647,13 +2576,23 @@ class Handler(SimpleHTTPRequestHandler):
     # ---- ingest (streamed) ----
     def _ingest_stream(self, c, body):
         folder = Path(c["source_folder"])
-        allowed = {x.strip().lower() for x in c["include_extensions"].split(",") if x.strip()}
+        allowed_value = str(c.get("include_extensions") or DEFAULTS["include_extensions"])
+        allowed = {x.strip().lower() for x in allowed_value.split(",") if x.strip()}
         mode = str(body.get("mode", "incremental")).lower()
         self._gone = False
         self.send_stream_start()
+        self.send_stream({"type": "progress", "phase": "starting", "percent": 1,
+                          "text": "Backend connected. Reading settings and preparing folder scan..."})
         try:
             existing = load(INDEX_FILE, {"chunks": [], "files": {}, "chunk_params": None})
             params = chunk_params_sig(c)
+            if mode == "full":
+                existing = {"chunks": [], "files": {}, "chunk_params": None}
+                _EMBED_CACHE.clear()
+                with _DOCUMENT_TEXT_CACHE_LOCK:
+                    _DOCUMENT_TEXT_CACHE.clear()
+                invalidate_index_cache()
+                self._log("Full rebuild: cleared RAM index and embedding caches; all vectors will be regenerated.")
             if mode != "full" and existing.get("chunk_params") != params:
                 mode = "full"
                 self._log("Chunking parameters changed — forcing a full rebuild.", "warn")
@@ -1665,30 +2604,80 @@ class Handler(SimpleHTTPRequestHandler):
                          else "Scanning for new or changed documents (saved vectors are reused)..."),
             })
 
-            files = [p for p in folder.rglob("*")
-                     if p.is_file() and p.suffix.lower() in allowed and DATA not in p.parents]
+            if not folder.is_dir():
+                raise RuntimeError(f"Source folder does not exist or is not accessible: {folder}")
+            all_files, scan_errors = [], []
+            try:
+                scanned_entries = 0
+                last_scan_update = time.time()
+                for p in folder.rglob("*"):
+                    scanned_entries += 1
+                    try:
+                        if p.is_file() and DATA not in p.parents:
+                            all_files.append(p)
+                    except OSError as exc:
+                        scan_errors.append(f"{p}: {exc}")
+                    if scanned_entries % 250 == 0 or time.time() - last_scan_update >= 2:
+                        self.send_stream({"type": "progress", "phase": "scan", "percent": 3,
+                                          "text": f"Scanning folder... {scanned_entries:,} entries checked; {len(all_files):,} files found."})
+                        last_scan_update = time.time()
+            except OSError as exc:
+                raise RuntimeError(f"Unable to scan source folder {folder}: {exc}") from exc
+            ext_counts = Counter((p.suffix.lower() or "[no extension]") for p in all_files)
+            files = [p for p in all_files if p.suffix.lower() in allowed]
             current_sigs = {str(p): file_signature(p) for p in files}
+            top_types = ", ".join(f"{ext}={count}" for ext, count in ext_counts.most_common(12)) or "none"
+            self._log(f"Folder scan complete: {len(all_files)} total file(s); {len(files)} supported. Types: {top_types}")
+            if scan_errors:
+                self._log(f"Folder scan had {len(scan_errors)} inaccessible path(s); first: {scan_errors[0]}", "warn")
+            if not files:
+                allowed_text = ", ".join(sorted(allowed))
+                found_text = top_types
+                message = (f"No supported documents found. Scanned {len(all_files)} file(s) under {folder}. "
+                           f"Allowed types: {allowed_text}. Found types: {found_text}.")
+                if ext_counts.get(".msg") and ".msg" not in allowed:
+                    message += " Add .msg to File types, then retry."
+                self._log(message, "error")
+                self.send_stream({"type": "error", "error": message})
+                return
 
             reused, changed = [], files
             if mode != "full":
                 old_sigs = existing.get("files", {})
+
+                # ADD / UPDATE IS APPEND-PRESERVING:
+                # Keep every previously indexed document that is absent from the
+                # current scan. This includes files excluded by File types and files
+                # later removed from the source folder. A same-path file that still
+                # exists but has changed is replaced by its newly parsed passages.
+                # Only Rebuild from scratch or Delete index removes retained content.
+                retained_absent = {
+                    old_path: old_sig for old_path, old_sig in old_sigs.items()
+                    if old_path not in current_sigs
+                }
+                if retained_absent:
+                    current_sigs.update(retained_absent)
+                    self._log(
+                        f"Retaining {len(retained_absent)} previously indexed document(s) "
+                        "not present in the current scan.", "ok"
+                    )
+
                 reused = [
                     ch for ch in existing.get("chunks", [])
-                    if isinstance(ch, dict) and ch.get("embedding") and ch.get("path") in current_sigs
-                    and old_sigs.get(ch.get("path")) == current_sigs[ch.get("path")]
+                    if isinstance(ch, dict) and ch.get("embedding")
+                    and ch.get("path") in current_sigs
+                    and old_sigs.get(ch.get("path")) == current_sigs.get(ch.get("path"))
                 ]
                 reused_paths = {ch.get("path") for ch in reused}
                 changed = [p for p in files if str(p) not in reused_paths]
-                dropped = len([s for s in old_sigs if s not in current_sigs])
                 self.send_stream({
                     "type": "progress", "phase": "ingest", "percent": 8,
-                    "text": (f"Reusing {len(reused)} saved passage(s) from "
-                             f"{len(files) - len(changed)} unchanged document(s). "
-                             f"Updating {len(changed)} changed/new document(s)"
-                             + (f" and dropping {dropped} removed file(s)." if dropped else ".")),
+                    "text": (f"Reusing {len(reused)} saved passage(s). "
+                             f"Updating {len(changed)} changed/new document(s). "
+                             f"Retaining {len(retained_absent)} document(s) absent from this scan."),
                 })
                 self._log(f"{len(files)} file(s) found — {len(reused)} passage(s) reusable, "
-                          f"{len(changed)} to process.")
+                          f"{len(changed)} to process, {len(retained_absent)} retained absent document(s).")
             else:
                 self.send_stream({
                     "type": "progress", "phase": "ingest", "percent": 8,
@@ -1697,13 +2686,19 @@ class Handler(SimpleHTTPRequestHandler):
                 self._log(f"{len(files)} supported document(s) found.")
 
             new_chunks, errors = [], []
+            with SNAPSHOT_MANIFEST_LOCK:
+                snapshot_manifest = load_snapshot_manifest()
             for number, p in enumerate(changed, 1):
                 if self._gone:
                     return
                 try:
                     added = chunks_for(p, c)
+                    snapshot_record = save_document_snapshot(p, folder, manifest=snapshot_manifest)
+                    for chunk in added:
+                        chunk["document_id"] = snapshot_record["document_id"]
+                        chunk["snapshot_available"] = True
                     new_chunks.extend(added)
-                    self._log(f"Parsed {p.name} — {len(added)} passage(s).")
+                    self._log(f"Parsed and snapshotted {p.name} — {len(added)} passage(s), {snapshot_record['snapshot_chars']:,} extracted characters retained.")
                 except Exception as e:
                     errors.append(f"{p.name}: {e}")
                     self._log(f"Failed to parse {p.name} — {e}", "error")
@@ -1712,6 +2707,13 @@ class Handler(SimpleHTTPRequestHandler):
                     "percent": 8 + round(20 * number / max(len(changed), 1)),
                     "text": f"Processed {number} of {len(changed)} document(s): {p.name}",
                 })
+
+            # Keep snapshots for current indexed files and save the manifest atomically.
+            current_document_ids = {chunk.get("document_id") for chunk in (reused + new_chunks) if chunk.get("document_id")}
+            snapshot_manifest["documents"] = {doc_id: rec for doc_id, rec in snapshot_manifest.get("documents", {}).items()
+                                                if doc_id in current_document_ids or Path(rec.get("snapshot", "")).is_file()}
+            with SNAPSHOT_MANIFEST_LOCK:
+                save_json(SNAPSHOT_MANIFEST_FILE, snapshot_manifest)
 
             if not new_chunks and not reused:
                 self._log("No supported text found in the selected folder.", "error")
@@ -1728,13 +2730,41 @@ class Handler(SimpleHTTPRequestHandler):
                              f"passage(s) using {HARDWARE['label']}..."),
                 })
                 self._log(f"Embedding {len(new_chunks)} passage(s) with {embedding_model}...")
-                batch_size = max(16, HARDWARE["embedding_workers"] * 16)
+                workers = positive(c.get("embedding_workers"), 1, 1, 16)
+                batch_size = max(1, workers)
+                backend = "CPU" if EMBED_SERVER.gpu_layers == 0 else detect_gpu_backend().upper()
+                self._log(f"Embedding backend: {backend}; workers={workers}; request timeout={positive(c.get('embedding_request_timeout'), 90, 15, 600)}s.")
                 for start in range(0, len(new_chunks), batch_size):
                     if self._gone:
                         return
                     batch = new_chunks[start:start + batch_size]
-                    for item, vector in zip(batch, embed(c, [x["text"] for x in batch])):
-                        item["embedding"] = vector
+                    def embedding_event(ev, base=start, total=len(new_chunks)):
+                        absolute = min(total, base + int(ev.get("item", 1)))
+                        kind = ev.get("event")
+                        if kind == "heartbeat":
+                            msg = (f"Heartbeat: {backend} embedding passage {absolute}/{total} "
+                                   f"still active ({ev.get('elapsed', 0)}s in current request).")
+                            self.send_stream({"type": "heartbeat", "phase": "embedding",
+                                              "percent": 30 + round(50 * max(0, absolute - 1) / total),
+                                              "text": msg, "elapsed": ev.get("elapsed", 0),
+                                              "current": absolute, "total": total, "backend": backend})
+                            self._log(msg)
+                        elif kind == "retry":
+                            self._log(f"Passage {absolute}/{total}: context overflow; retrying with shorter text. {ev.get('error','')}", "warn")
+                        elif kind == "error":
+                            self._log(f"Passage {absolute}/{total}: embedding request failed without repeated retries. {ev.get('error','')}", "warn")
+                    vectors = embed(c, [x["text"] for x in batch], tolerate_errors=True,
+                                    on_progress=embedding_event)
+                    failed = 0
+                    for item, vector in zip(batch, vectors):
+                        if vector is None:
+                            failed += 1
+                            errors.append(f"{item.get('source', 'passage')}: embedding failed")
+                            self._log(f"Skipped one passage from {item.get('source', 'unknown')} after an embedding error.", "warn")
+                        else:
+                            item["embedding"] = vector
+                    if failed:
+                        self._log(f"Embedding batch completed with {failed} skipped passage(s); ingestion will continue.", "warn")
                     done_count = min(start + len(batch), len(new_chunks))
                     self._log(f"Vectorized {done_count}/{len(new_chunks)} passage(s).")
                     self.send_stream({
@@ -1742,6 +2772,9 @@ class Handler(SimpleHTTPRequestHandler):
                         "percent": 30 + round(50 * done_count / len(new_chunks)),
                         "text": f"Vectorized {done_count} of {len(new_chunks)} passage(s)",
                     })
+                new_chunks = [x for x in new_chunks if x.get("embedding")]
+                if not new_chunks and not reused:
+                    raise RuntimeError("All passages failed to embed; check the embedding server log and context setting.")
             else:
                 self._log("No new passages to embed — reusing all saved vectors.", "ok")
                 self.send_stream({"type": "progress", "phase": "ingest", "percent": 80,
@@ -1890,6 +2923,84 @@ class Handler(SimpleHTTPRequestHandler):
                 out[kind] = d
             return self.send_json({"servers": out})
 
+        if self.path == "/api/pst/dependencies":
+            return self.send_json(pst_dependency_report())
+        if self.path.startswith("/api/pst/status"):
+            job_id = parse_qs(urlparse(self.path).query).get("job", [""])[0]
+            with PST_JOBS_LOCK:
+                job = dict(PST_JOBS.get(job_id, {}))
+            return self.send_json(job if job else {"error": "PST job not found."}, 200 if job else 404)
+
+
+        if self.path.startswith("/api/document-text"):
+            try:
+                params = parse_qs(urlparse(self.path).query)
+                requested = params.get("path", [""])[0]
+                document_id = params.get("document_id", [""])[0]
+                offset = max(0, int(params.get("offset", ["0"])[0] or 0))
+                requested_limit = int(params.get("limit", [str(DOCUMENT_VIEW_PAGE_CHARS)])[0] or DOCUMENT_VIEW_PAGE_CHARS)
+                limit = max(1000, min(requested_limit, DOCUMENT_VIEW_PAGE_CHARS))
+                content, source_kind, active_path, record, cache_hit = "", "original", "", {}, False
+                try:
+                    target = safe_source_document(requested)
+                    content, cache_hit = cached_full_document_text(target)
+                    active_path = str(target)
+                except (FileNotFoundError, PermissionError, OSError):
+                    if document_id:
+                        with SNAPSHOT_MANIFEST_LOCK:
+                            record = load_snapshot_manifest().get("documents", {}).get(document_id, {})
+                        relocated = record.get("current_path", "")
+                        if relocated and Path(relocated).is_file() and relocated != requested:
+                            try:
+                                target = Path(relocated).resolve(strict=True)
+                                content, cache_hit = cached_full_document_text(target)
+                                active_path, source_kind = str(target), "relocated"
+                            except Exception:
+                                content = ""
+                        if not content:
+                            content, record = read_document_snapshot(document_id)
+                            active_path, source_kind, cache_hit = record.get("snapshot", ""), "snapshot", True
+                    else:
+                        raise FileNotFoundError("Original document is missing and no snapshot identity was supplied.")
+                total = len(content)
+                page = content[offset:offset + limit]
+                next_offset = offset + len(page)
+                return self.send_json({"success": True, "path": active_path, "original_path": requested,
+                    "document_id": document_id, "text": page, "offset": offset,
+                    "returned": len(page), "total_chars": total,
+                    "next_offset": next_offset if next_offset < total else None,
+                    "complete": next_offset >= total, "cache_hit": cache_hit,
+                    "source_kind": source_kind, "using_fallback": source_kind == "snapshot",
+                    "original_missing": source_kind in ("snapshot", "relocated"),
+                    "snapshot_created": record.get("snapshot_created", ""),
+                    "expected_relative_path": record.get("relative_path", "")})
+            except ValueError as exc:
+                return self.send_json({"success": False, "error": f"Invalid document request: {exc}"}, 400)
+            except Exception as exc:
+                print(f"[document-text] {type(exc).__name__}: {exc}", flush=True)
+                return self.send_json({"success": False, "error": f"Document retrieval failed: {type(exc).__name__}: {exc}"}, 500)
+
+        if self.path.startswith("/api/open-path"):
+            params = parse_qs(urlparse(self.path).query)
+            requested = params.get("path", [""])[0]
+            reveal = params.get("reveal", ["0"])[0] == "1"
+            try:
+                target = safe_source_document(requested)
+                if os.name == "nt":
+                    if reveal:
+                        subprocess.Popen(["explorer", "/select,", str(target)])
+                    else:
+                        os.startfile(str(target))
+                elif sys.platform == "darwin":
+                    subprocess.Popen(["open", "-R" if reveal else str(target)] + ([str(target)] if reveal else []))
+                else:
+                    subprocess.Popen(["xdg-open", str(target.parent if reveal else target)])
+                return self.send_json({"success": True, "path": str(target), "reveal": reveal})
+            except FileNotFoundError:
+                return self.send_json({"success": False, "error": "Original document no longer exists."}, 404)
+            except Exception as exc:
+                return self.send_json({"success": False, "error": str(exc)}, 500)
+
         if self.path == "/api/settings":
             return self.send_json(settings())
 
@@ -1906,8 +3017,11 @@ class Handler(SimpleHTTPRequestHandler):
             })
         if self.path == "/api/status":
             idx = load(INDEX_FILE, {"chunks": [], "updated": None})
-            return self.send_json({"chunks": len(idx["chunks"]), "updated": idx.get("updated"),
+            return self.send_json({"chunks": len(idx.get("chunks", [])), "updated": idx.get("updated"),
+                "index_exists": INDEX_FILE.exists(), "lancedb_exists": (DATA / "lancedb").exists(),
+                "embedding_cache_entries": len(_EMBED_CACHE),
                 "hardware": HARDWARE["label"], "gpu_backend": detect_gpu_backend()})
+
 
         if self.path == "/api/models":
             state, detail = "connected", ""
@@ -1934,8 +3048,23 @@ class Handler(SimpleHTTPRequestHandler):
                 "state": state,
                 "detail": detail if state != "connected" else "",
             })
-        if self.path == "/":
-            self.path = "/index.html"
+        # Serve the UI explicitly. This avoids directory redirects, stale cached
+        # responses and browser confusion if the working directory changes.
+        clean_path = self.path.split("?", 1)[0]
+        if clean_path in ("/", "/index.html"):
+            try:
+                raw = (ROOT / "index.html").read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(raw)))
+                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+                self.send_header("Pragma", "no-cache")
+                self.send_header("Expires", "0")
+                self.end_headers()
+                self.wfile.write(raw)
+                return
+            except Exception as exc:
+                return self.send_json({"error": f"Unable to serve index.html: {exc}"}, 500)
         return super().do_GET()
 
     def do_POST(self):
@@ -1977,20 +3106,46 @@ class Handler(SimpleHTTPRequestHandler):
                 return
 
 
+            if self.path == "/api/pst/import":
+                c = settings()
+                pst_path = str(body.get("pst_path") or c.get("pst_path") or "").strip()
+                try:
+                    if not pst_path or not Path(pst_path).expanduser().is_file():
+                        return self.send_json({"success": False, "error": "Enter an existing PST file path."}, 400)
+                    job = start_pst_job(pst_path, c)
+                    return self.send_json({"success": True, "job": job["id"], "state": job["state"]}, 202)
+                except Exception as exc:
+                    return self.send_json({"success": False, "error": str(exc)}, 400)
+
+            if self.path == "/api/document-relocate":
+                document_id = str(body.get("document_id") or "").strip()
+                folder = str(body.get("folder") or "").strip()
+                if not document_id or not folder:
+                    return self.send_json({"success": False, "error": "Document identity and replacement folder are required."}, 400)
+                try:
+                    report = locate_snapshot_document(document_id, folder)
+                    return self.send_json({"success": True, **report})
+                except Exception as exc:
+                    return self.send_json({"success": False, "error": str(exc)}, 400)
+
             if self.path == "/api/settings":
-                current = settings()
                 allowed = set(DEFAULTS)
                 updated = {key: value for key, value in body.items() if key in allowed}
                 if updated.get("source_folder") and not Path(updated["source_folder"]).is_dir():
                     return self.send_json({"error": "Enter an existing local document folder path."}, 400)
-                for key in ("use_llm_rerank", "adaptive_rag", "use_hyde", "use_lancedb", "gpu_offload"):
+                for key in ("use_llm_rerank", "adaptive_rag", "use_hyde", "use_lancedb", "gpu_offload", "pst_extract_attachments"):
                     if key in updated:
                         updated[key] = str(updated[key]).lower() == "true"
-                gpu_changed = any(k in updated for k in ("gpu_offload", "gpu_layers"))
-                save_json(SETTINGS_FILE, {**current, **updated})
+                gpu_changed = any(k in updated for k in ("gpu_offload", "gpu_layers", "local_server_parallel", "local_server_batch"))
+                # Hold the same per-file lock across read + merge + write so two
+                # simultaneous auto-saves cannot overwrite each other's fields.
+                with _json_lock_for(SETTINGS_FILE):
+                    current = settings()
+                    save_json(SETTINGS_FILE, {**current, **updated})
+                    saved = settings()
                 if gpu_changed:   # apply GPU offload change without a full app restart
                     threading.Thread(target=lambda: _start_local_servers(settings(), wait=True), daemon=True).start()
-                return self.send_json(settings())
+                return self.send_json(saved)
 
             if self.path == "/api/load-model":
                 key = (body.get("model") or "").strip()
@@ -2040,7 +3195,8 @@ class Handler(SimpleHTTPRequestHandler):
             if self.path == "/api/ingest":
                 c = settings()
                 folder = Path(c["source_folder"])
-                allowed = {x.strip().lower() for x in c["include_extensions"].split(",") if x.strip()}
+                allowed_value = str(c.get("include_extensions") or DEFAULTS["include_extensions"])
+                allowed = {x.strip().lower() for x in allowed_value.split(",") if x.strip()}
                 docs, errors = [], []
                 for p in folder.rglob("*"):
                     if p.is_file() and p.suffix.lower() in allowed and DATA not in p.parents:
@@ -2125,28 +3281,47 @@ class Handler(SimpleHTTPRequestHandler):
                     self.send_stream({"type": "error", "error": "Enter a question to search your documents."})
                     self.send_stream({"type": "done", "aborted": True})
                     return
-                evidence_only = not c["chat_model"]
-                want_answer = bool(body.get("answer", True)) and not evidence_only
+                # The request toggle is authoritative. A missing answer model also
+                # forces evidence-only mode.
+                retrieval_only = bool(body.get("retrieval_only", False))
+                evidence_only = retrieval_only or (not bool(body.get("answer", True))) or (not c["chat_model"])
+                want_answer = not evidence_only
                 self.send_stream_start()
                 self._answer_stream(c, query, want_answer, evidence_only, bool(body.get("adaptive", True)))
                 return
             
             if self.path == "/api/index/clear":
-                for candidate in (INDEX_FILE, INDEX_FILE.with_suffix(".tmp")):
+                removed = []
+                candidates = [INDEX_FILE, INDEX_FILE.with_suffix(".tmp")]
+                candidates.extend(DATA.glob("index.json.*.tmp"))
+                candidates.extend(DATA.glob("index.*.tmp"))
+                for candidate in dict.fromkeys(candidates):
                     try:
-                        candidate.unlink()
-                    except OSError:
-                        pass
-                
+                        if candidate.exists():
+                            candidate.unlink()
+                            removed.append(str(candidate))
+                    except OSError as exc:
+                        return self.send_json({"cleared": False, "error": f"Could not delete {candidate}: {exc}"}, 500)
                 db_path = DATA / "lancedb"
                 if db_path.exists():
                     try:
                         shutil.rmtree(db_path)
-                    except OSError:
-                        pass
-                
+                        removed.append(str(db_path))
+                    except OSError as exc:
+                        return self.send_json({"cleared": False, "error": f"Could not delete LanceDB: {exc}"}, 500)
                 invalidate_index_cache()
-                return self.send_json({"cleared": True})
+                with _DOCUMENT_TEXT_CACHE_LOCK:
+                    _DOCUMENT_TEXT_CACHE.clear()
+                try:
+                    SNAPSHOT_MANIFEST_FILE.unlink(missing_ok=True)
+                    if SNAPSHOT_DIR.exists():
+                        shutil.rmtree(SNAPSHOT_DIR)
+                    SNAPSHOT_DIR.mkdir(exist_ok=True)
+                except OSError as exc:
+                    return self.send_json({"cleared": False, "error": f"Could not clear document snapshots: {exc}"}, 500)
+                _EMBED_CACHE.clear()
+                empty = not INDEX_FILE.exists() and not db_path.exists()
+                return self.send_json({"cleared": empty, "chunks": 0, "removed": removed}, 200 if empty else 500)
             self.send_json({"error": "Not found"}, 404)
         except Exception as e:
             try:
@@ -2157,8 +3332,17 @@ class Handler(SimpleHTTPRequestHandler):
 
 if __name__ == "__main__":
     os.chdir(ROOT)
+    # Port 8765 is the actual Offline RAG application. Ports 8787 and 8788
+    # are internal llama-server model APIs and their built-in diagnostic UIs.
+    try:
+        web_server = ThreadingHTTPServer(("127.0.0.1", 8765), Handler)
+    except OSError as exc:
+        print(f"ERROR: could not start Offline RAG UI on port 8765: {exc}", flush=True)
+        print("Close older Offline RAG/Python processes and run the launcher again.", flush=True)
+        raise
+    print(f"GPU backend: {detect_gpu_backend().upper()}", flush=True)
+    print("OFFLINE RAG UI READY: http://127.0.0.1:8765/", flush=True)
+    print("Internal APIs only: embedding=8787, reranker=8788", flush=True)
     _start_local_servers(settings(), wait=False)
     atexit.register(_shutdown_local_servers)
-    print(f"GPU backend: {detect_gpu_backend().upper()}")
-    print("Offline RAG: http://127.0.0.1:8765")
-    ThreadingHTTPServer(("127.0.0.1", 8765), Handler).serve_forever()
+    web_server.serve_forever()
