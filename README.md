@@ -326,6 +326,61 @@ Streams processing events, pipeline stage transitions, evidence updates, and gen
 Streams progress, parsing logs, and vectorization status during document ingestion.
 * **Payload**: `{"mode": "incremental" | "full"}`
 
+
+'''
+# Offline RAG — 310726 Fixes
+
+This update improves retrieval accuracy and evidence usability, especially for short keyword searches across indexed emails and documents.
+
+## What Was Fixed
+
+- **Immediate settings changes**  
+  Semantic and Keyword weighting is automatically saved and applied to the next enquiry. No application restart or index rebuild is required.
+
+- **Collapsible evidence cards**  
+  Completed evidence cards automatically collapse to show the evidence title. Click the title—or press `Enter` or `Space` while it is focused—to expand or collapse the chunk content.
+
+- **Better exact-keyword retrieval**  
+  Passages without a literal keyword match are excluded from keyword ranking, preventing unrelated results from receiving lexical rank positions.
+
+- **Title and email-subject weighting**  
+  Matches in `THREAD SUBJECT`, `SUBJECT`, or the document filename receive more weight than matches found only in the body content.
+
+- **Short-query optimisation**  
+  One- and two-keyword searches, such as `APAC`, receive a stronger title and subject boost.
+
+- **Exact phrase boost**  
+  An exact phrase found in an email subject or document title receives additional relevance weight.
+
+- **Clearer evidence titles**  
+  Evidence cards display the extracted email subject or document title. The original source filename remains available in the tooltip.
+
+- **Improved citation navigation**  
+  Clicking a citation in the generated answer automatically expands and scrolls to the corresponding evidence card.
+
+## Files Changed
+
+### `app.py`
+
+- Improved retrieval scoring
+- Added title and email-subject extraction
+- Added short-query title weighting
+- Updated retrieval settings behaviour
+- Added title and keyword-score metadata
+
+### `index.html`
+
+- Added collapsible evidence cards
+- Added extracted title display
+- Added keyboard accessibility
+- Updated retrieval settings guidance
+
+## Upgrade Notes
+
+1. Replace the existing `app.py` and `index.html` files.
+2. Restart the application once to load the updated code.
+3. Continue using the existing index—a complete index rebuild is not required for these fixes.
+
 ---
 
 ## License
