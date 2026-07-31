@@ -1,159 +1,203 @@
+OfflineRAG/
+├── __pycache__/
+├── data/
+│   ├── document_manifest.json
+│   ├── document_snapshots/
+│   ├── logs/
+│   │   ├── embedding-server.log
+│   │   ├── pst_20260729_104312_ab4cb0ba.log
+│   │   └── reranker-server.log
+│   └── settings.json
+├── models/
+│   ├── bge-m3-Q4_K_M.gguf
+│   ├── bge-reranker-v2-gemma.Q4_K_M.gguf
+│   ├── bge-reranker-v2-m3-Q4_K_M.gguf
+│   ├── catalog.json
+│   ├── nomic-embed-text-v1.5.Q4_K_M.gguf
+│   ├── nomic-embed-text-v1.5.Q8_0.gguf
+│   └── snowflake-arctic-embed-l-v2.0-q4_k_m.gguf
+├── python/                          # Embedded portable Python 3.11 environment
+│   ├── python.exe
+│   ├── python311.dll
+│   ├── python311._pth
+│   ├── Lib/site-packages/           # Bundled packages (pywin32, openpyxl, rapidfuzz, etc.)
+│   └── Scripts/
+├── runtime/                         # llama-server execution binaries and CPU/GPU DLLs
+│   ├── llama-server.exe
+│   ├── ggml.dll
+│   └── [CPU/GPU backend DLLs]
+├── vendor/                          # Bundled third-party libraries
+│   └── pypdf/
+├── Install_GPU.bat                  # One-click GPU runtime downloader (CUDA / Vulkan)
+├── Install_LanceDB.bat              # Script to enable pip and install LanceDB
+├── Install_Models.bat               # Automated downloader for default GGUF models
+├── Start-Offline-RAG.bat            # One-click application launcher
+├── README.md                        # Documentation file
+├── app.py                           # Python backend application
+└── index.html                       # Frontend user interface
+```
+
+---
+
+### Complete Rewritten `README.md`
+
+```markdown
 # Offline RAG: Local Document Intelligence
 
-Offline RAG is a privacy-focused, workstation-based Document Intelligence and Retrieval-Augmented Generation (RAG) system. It runs entirely offline without relying on external cloud APIs or third-party data processing services.
+Offline RAG is an enterprise-grade, workstation-based Retrieval-Augmented Generation (RAG) and Document Intelligence system. It operates 100% offline, keeping all documents, vector indices, search telemetry, and chat interactions strictly on your local machine.
 
-The system combines a lightweight Python server (`app.py`) with a single-page web interface (`index.html`). It utilizes bundled `llama-server` instances for local embedding generation and reranking, while connecting to a local LM Studio instance for open-weights LLM inference.
-
----
-
-## Key Features
-
-### 1. Offline Execution & Privacy
-* Zero cloud dependencies for core operations. Documents, embeddings, vectors, and chat interactions remain entirely local.
-* Local embedding generation and reranking handled by bundled `llama-server` execution binaries.
-* LLM generation handled via LM Studio or any local OpenAI-compatible API endpoint.
-
-### 2. Advanced Retrieval Engine
-* **Hybrid Search**: Combines BM25 lexical keyword scoring with vector-based semantic cosine similarity using Reciprocal Rank Fusion (RRF).
-* **RAM In-Memory Acceleration**: Pre-allocated array buffers cache vector embeddings directly in RAM for rapid search iterations.
-* **LanceDB Integration**: Automatic high-performance vector storage and retrieval via LanceDB when installed.
-* **Local Reranking**: Re-scores search candidates using local cross-encoder reranker models (such as BGE Reranker v2-m3).
-
-### 3. Adaptive Corrective Loop
-* **Query Understanding**: Optionally rewrites user queries and generates Hypothetical Document Embeddings (HyDE) variants.
-* **Multi-Wave Search**: Formulates new search queries based on identified information gaps if initial candidate passages are insufficient.
-* **Passage Analysis**: Summarizes individual passages and assigns concrete relevance classifications (`ANSWERS`, `PARTIAL`, `RELATED`, `OFFTOPIC`).
-* **Sufficiency Checkpoints**: Periodically assesses whether accumulated evidence notes are sufficient to answer the query, reducing unnecessary processing.
-
-### 4. Comprehensive File Format Support
-* Text formats: `.txt`, `.md`, `.csv`, `.json`, `.jsonl`
-* Office documents: `.pdf`, `.docx`, `.doc`, `.pptx`, `.xlsx`, `.xlsm`, `.xls`
-* Outlook messages: `.msg`
-* Outlook PST archives: `.pst` (via Windows Outlook COM automation)
-
-### 5. Resilient Document Management
-* **Document Snapshots**: Retains compressed Gzip extracted-text snapshots along with SHA-256 fingerprinting.
-* **Document Viewer & Relocation**: View passage chunks or full document texts directly within the web interface. If original files move or disappear, the system automatically suggests matches based on content fingerprints and relative paths.
-
-### 6. Interactive Web Interface
-* Streaming answer delivery with inline citations `[n]`. Hovering over citations highlights the corresponding source card.
-* Detailed visual pipeline progress (Understand -> Retrieve -> Analyze -> Answer) and real-time telemetry logs.
-* Customization options: Toggle Adaptive RAG, Evidence-only mode, dark/light theme, retrieval weights, model parameters, and search limits.
+The application includes an embedded portable Python environment, bundled `llama-server` model endpoints, and a lightweight web interface. It uses local GGUF models for vector embedding and cross-encoder reranking, and connects to local LLM engines like LM Studio for chat generation and document analysis.
 
 ---
 
-## Architecture and Services
-
-```
-                       +-----------------------------------+
-                       |        Web Browser Interface     |
-                       |           (index.html)            |
-                       +-----------------+-----------------+
-                                         |
-                                         | HTTP / SSE (Port 8765)
-                                         v
-                       +-----------------+-----------------+
-                       |       Offline RAG Backend        |
-                       |             (app.py)              |
-                       +----+------------+------------+----+
-                            |            |            |
-         HTTP (Port 8787)   |            |            |   HTTP (Port 8788)
-   +------------------------+            |            +------------------------+
-   |                                     |                                     |
-   v                                     v                                     v
-+--+---------------------+    +----------+----------+    +---------------------+--+
-| Local Embedding Server |    |  LM Studio Server   |    | Local Reranker Server  |
-|  (llama-server.exe)    |    | (OpenAI API /v1)    |    |  (llama-server.exe)    |
-+------------------------+    +---------------------+    +------------------------+
-```
-
-### Server Port Allocation
-* **Port 8765**: Main Application Server (Python `http.server.ThreadingHTTPServer`). Serves the web application and handles REST API and Server-Sent Events (SSE) endpoints.
-* **Port 8787**: Local Embedding Server (`llama-server.exe`). Handles text vectorization requests.
-* **Port 8788**: Local Reranker Server (`llama-server.exe`). Cross-encoder reranking endpoint.
-* **Port 1234**: LM Studio Endpoint (Default: `http://127.0.0.1:1234/v1`). Provides chat completion models for query expansion, passage analysis, and final answer generation.
-
----
-
-## Directory Structure
+## Repository Directory Structure
 
 ```
 OfflineRAG/
-├── app.py                      # Core Python HTTP server, pipeline, and PST backend
-├── index.html                  # Single-page frontend interface
-├── data/                       # System data, logs, index, and settings
-│   ├── settings.json           # Active application configuration
-│   ├── index.json              # Main document vector and lexical index
-│   ├── document_manifest.json  # Fingerprint manifest for snapshots
-│   ├── document_snapshots/     # Gzip-compressed extracted text snapshots
-│   ├── lancedb/                 # LanceDB database directory (optional)
-│   └── logs/                   # Server execution logs
-├── models/                     # GGUF models for embedding and reranking
+├── __pycache__/
+├── data/                            # Application logs, settings, index, and snapshots
+│   ├── document_manifest.json       # SHA-256 fingerprint manifest for snapshot tracking
+│   ├── document_snapshots/          # Gzip-compressed extracted text snapshots
+│   ├── logs/                        # Server and PST extraction logs
+│   ├── lancedb/                     # LanceDB vector database (created upon setup)
+│   ├── settings.json                # System runtime configuration
+│   └── index.json                   # In-memory JSON fallback vector index
+├── models/                          # GGUF models for embedding and reranking
+│   ├── catalog.json                 # Model catalog metadata
 │   ├── nomic-embed-text-v1.5.Q4_K_M.gguf
-│   ├── bge-reranker-v2-m3-Q4_K_M.gguf
-│   └── catalog.json            # Model catalog configurations
-├── runtime/                    # llama-server executable binaries & GPU DLLs
+│   └── bge-reranker-v2-m3-Q4_K_M.gguf
+├── python/                          # Embedded portable Python 3.11 distribution
+│   ├── python.exe
+│   ├── python311._pth
+│   └── Lib/site-packages/           # Bundled libraries (pywin32, openpyxl, rapidfuzz, etc.)
+├── runtime/                         # Local llama-server execution engine
 │   ├── llama-server.exe
-│   ├── ggml-cuda.dll           # CUDA GPU acceleration library (optional)
-│   └── ggml-vulkan.dll         # Vulkan GPU acceleration library (optional)
-└── vendor/                     # Bundled Python library dependencies
+│   ├── ggml.dll
+│   └── [ggml-cuda.dll / ggml-vulkan.dll]
+├── vendor/                          # Pure-Python fallback packages
+│   └── pypdf/
+├── Install_GPU.bat                  # Automatically installs CUDA or Vulkan llama.cpp runtime
+├── Install_LanceDB.bat              # Installs LanceDB and NumPy into portable Python
+├── Install_Models.bat               # Downloads default GGUF embedding and reranker models
+├── Start-Offline-RAG.bat            # One-click launcher for Windows
+├── README.md                        # Project documentation
+├── app.py                           # Core Python backend server and RAG pipeline
+└── index.html                       # Single-page web application interface
 ```
 
 ---
 
-## System Requirements
+## Architectural Features
 
-### Platform Support
-* **Operating System**: Windows 10/11 (required for Outlook PST extraction via COM). Linux and macOS are supported for standard document processing and RAG operations.
-* **Python**: Version 3.8 or higher.
-* **RAM**: 8 GB minimum; 16 GB or more recommended when working with large document sets.
-* **GPU (Optional)**: NVIDIA GPU with CUDA support or Vulkan-compatible GPU for accelerated local embeddings and reranking via `llama-server`.
+### 1. Zero-Cloud Privacy and Security
+* All document processing, vectorization, reranking, and query handling are executed locally on your workstation.
+* Network traffic is confined to `127.0.0.1` loopback interfaces. No external APIs or telemetry servers are contacted.
 
-### Optional Python Dependencies
-The server uses standard library modules by default, but enhanced format support relies on the following packages:
+### 2. Hybrid Search Engine
+* **BM25 Lexical Keyword Search**: Indexing engine with TF-IDF/BM25 scoring to match exact strings, serial numbers, codes, and names.
+* **Vector Semantic Search**: High-dimensional cosine similarity matching powered by local GGUF embedding models.
+* **Reciprocal Rank Fusion (RRF)**: Merges keyword and semantic result ranks into a unified candidate pool.
+* **Cross-Encoder Reranking**: Re-evaluates retrieved candidates using local cross-encoder models (e.g., BGE Reranker v2-m3) via a separate llama-server instance.
+* **LanceDB Storage Support**: Sub-millisecond vector querying via native LanceDB integration when installed.
+* **RAM In-Memory Acceleration**: Uses native C-array memory buffers for fast vector searches when running without a vector database.
 
-```bash
-# Basic optional capabilities
-pip install numpy lancedb pypdf openpyxl python-docx xlrd
+### 3. Adaptive Corrective RAG Pipeline
+* **Query Expansion and HyDE**: Generates optimized search queries and Hypothetical Document Embeddings (HyDE) variants via an evidence analysis LLM.
+* **Multi-Wave Corrective Retrieval**: If candidate passages are insufficient, the engine analyzes the missing information gap, generates revised search terms, and performs secondary retrieval waves.
+* **Passage Analysis**: Summarizes individual passages and assigns explicit relevance classifications (`ANSWERS`, `PARTIAL`, `RELATED`, `OFFTOPIC`).
+* **Sufficiency Checkpoints**: Periodically checks whether accumulated notes contain enough facts to answer the question, avoiding redundant LLM passes.
 
-# Outlook MSG and PST support
-pip install pywin32 extract-msg rapidfuzz
+### 4. Comprehensive File Ingestion
+* **Plaintext & Structured**: `.txt`, `.md`, `.csv`, `.json`, `.jsonl`
+* **Documents & Presentations**: `.pdf`, `.docx`, `.doc` (via MS Word/Antiword), `.pptx`
+* **Spreadsheets**: `.xlsx`, `.xlsm`, `.xls` (groups Excel rows into cohesive passage chunks)
+* **Outlook Emails & Archives**: `.msg` files and full `.pst` archives using Outlook COM automation with conversation threading and fuzzy attachment deduplication.
+
+### 5. Document Snapshots & Resilience
+* **Gzip Text Snapshots**: Stores compressed full-text snapshots and SHA-256 content fingerprints during ingestion.
+* **File Relocation Recovery**: If source files are moved or deleted, the system scans replacement directories and verifies content fingerprints to re-link original documents.
+* **Document Viewer**: Interactive UI modal allows viewing passage chunks, extracted document text, or opening original files in Explorer.
+
+---
+
+## Port Allocation
+
+* **Port 8765**: Application Web Interface and Backend Server (`app.py`).
+* **Port 8787**: Embedded Local Embedding Server (`llama-server.exe`).
+* **Port 8788**: Embedded Local Reranker Server (`llama-server.exe`).
+* **Port 1234**: LM Studio Endpoint (Default: `http://127.0.0.1:1234/v1`).
+
+---
+
+## Quick Start Guide (Windows)
+
+The repository includes a portable Python environment, pre-configured batch scripts, and embedded binaries for one-click setup on Windows.
+
+### Step 1: Download Default Models
+Run `Install_Models.bat` to download the default embedding model (`nomic-embed-text-v1.5.Q4_K_M.gguf`) and reranker model (`bge-reranker-v2-m3-Q4_K_M.gguf`) into the `models/` folder.
+
+```cmd
+Install_Models.bat
 ```
 
+### Step 2: (Optional) Enable GPU Acceleration
+By default, `llama-server` runs on CPU. To enable GPU offloading for NVIDIA (CUDA) or universal GPUs (Vulkan):
+
+```cmd
+Install_GPU.bat
+```
+
+This script detects your display hardware via `Win32_VideoController` and `nvidia-smi`, queries GitHub for the matching `llama.cpp` release binaries, backs up `runtime/` to `runtime_cpu_backup/`, and extracts the GPU-enabled server and DLLs.
+
+### Step 3: (Optional) Enable LanceDB Vector Storage
+To enable native LanceDB vector indexing for large document sets:
+
+```cmd
+Install_LanceDB.bat
+```
+
+This script enables site-packages in the portable Python environment (`python311._pth`) and installs `lancedb` and `numpy`.
+
+### Step 4: Configure LM Studio
+1. Launch **LM Studio**.
+2. Load an Evidence Analysis model (a small, fast model like Qwen2.5-1.5B or Llama-3.2-3B is recommended) and a Final Answer model (such as Llama-3-8B or Mistral-7B).
+3. Start the Local Server inside LM Studio on port `1234` (`http://127.0.0.1:1234/v1`).
+
+### Step 5: Launch Offline RAG
+Double-click `Start-Offline-RAG.bat` or run:
+
+```cmd
+Start-Offline-RAG.bat
+```
+
+The script starts `app.py` using the portable Python executable and opens `http://127.0.0.1:8765` in your default browser.
+
 ---
 
-## Installation and Setup
+## Batch Scripts Summary
 
-### 1. Clone or Copy the Repository
-Place `app.py` and `index.html` in your root project folder. Ensure the required directories (`data/`, `models/`, `runtime/`) exist or allow the application to create them at startup.
-
-### 2. Add GGUF Local Models
-Download the supported GGUF model files into the `models/` directory:
-
-* **Embedding Model**: `nomic-embed-text-v1.5.Q4_K_M.gguf` or `bge-m3-Q4_K_M.gguf`
-* **Reranker Model**: `bge-reranker-v2-m3-Q4_K_M.gguf`
-
-*Note: You can also download these models directly through the application's Settings interface.*
-
-### 3. Add llama-server Executables
-Place `llama-server` (or `llama-server.exe` on Windows) inside the `runtime/` directory. Include any required acceleration DLLs (e.g., `ggml-cuda.dll` or `ggml-vulkan.dll`) in the same folder.
-
-### 4. Configure LM Studio
-1. Open **LM Studio**.
-2. Load a fast small LLM (e.g., 0.5B to 3B parameters) for evidence analysis and a larger model for final answer generation.
-3. Start the Local Server in LM Studio (default port `1234`).
+* `Start-Offline-RAG.bat`: Launches `app.py` in the background via `python\python.exe`, waits 3 seconds, and opens `http://127.0.0.1:8765` in your default web browser.
+* `Install_Models.bat`: Downloads `nomic-embed-text-v1.5.Q4_K_M.gguf` and `bge-reranker-v2-m3-Q4_K_M.gguf` using `curl` from verified public Hugging Face mirrors.
+* `Install_GPU.bat`: Embedded PowerShell installer wrapped in a batch file. Automatically selects between CUDA 12/13 or Vulkan, downloads the latest release from `ggml-org/llama.cpp`, and installs GPU runtime DLLs into `runtime/`.
+* `Install_LanceDB.bat`: Configures site-packages access for the embedded portable Python engine and installs `lancedb` and `numpy`.
 
 ---
 
-## Running the Application
+## Cross-Platform Setup (Linux / macOS / Non-Portable Python)
 
-1. Launch the application server:
+To run Offline RAG on Linux, macOS, or standard system Python installations:
+
+1. **Install Dependencies**:
+   ```bash
+   pip install numpy lancedb pypdf openpyxl python-docx xlrd extract-msg rapidfuzz pywin32
+   ```
+2. **Setup Runtime Binaries**:
+   Download the compiled `llama-server` binary for your operating system and place it inside the `runtime/` directory as `runtime/llama-server`.
+3. **Download Models**:
+   Place GGUF models in the `models/` directory.
+4. **Run the Application**:
    ```bash
    python app.py
-   ```
-2. Open your web browser and navigate to:
-   ```
-   http://127.0.0.1:8765/
    ```
 
 ---
@@ -162,139 +206,66 @@ Place `llama-server` (or `llama-server.exe` on Windows) inside the `runtime/` di
 
 ### Standard Document Ingestion
 1. Open the **Settings** panel (gear icon in top right).
-2. Under the **Indexing** section, set the **Source folder** path containing your documents.
-3. Specify the supported file extensions in **File types** (e.g., `.txt,.md,.pdf,.docx,.xlsx`).
-4. Select an ingestion mode:
-   * **Add / update**: Scans the folder, processes new or updated files, reuses existing vector embeddings, and retains previously indexed documents excluded by temporary extension filters.
-   * **Rebuild from scratch**: Clears the index database and re-indexes all files from scratch.
+2. Set the **Source folder** path containing your documents.
+3. Configure **File types** (e.g., `.txt,.md,.pdf,.docx,.xlsx,.msg`).
+4. Select an action:
+   * **Add / update**: Incrementally scans the target folder, processes new or modified files, reuses existing vector embeddings, and preserves previously indexed documents even if temporary file extension filters are changed.
+   * **Rebuild from scratch**: Clears existing indices and rebuilds all vector representations from scratch.
 
-### Outlook PST Archive Ingestion
-1. In the **Settings** panel under **Outlook PST ingestion**, enter the full path to your `.pst` file.
-2. Choose a **Processing mode**:
-   * **Emails first**: Extracts email bodies and metadata (fastest).
-   * **Attachments only**: Processes allowed file attachments with fuzzy filename deduplication.
-   * **Emails and attachments together**: Fully extracts emails and matching attachments.
+### Outlook PST Ingestion
+1. In the **Settings** panel under **Outlook PST Ingestion**, enter the full path to your `.pst` file (e.g., `C:\Users\Name\Documents\Archive.pst`).
+2. Select a **Processing mode**:
+   * **1. Emails first**: Extracts email message bodies and headers (fastest).
+   * **2. Attachments only**: Extracts allowed file attachments with fuzzy filename deduplication.
+   * **Emails and attachments together**: Processes both message bodies and attachments.
 3. Click **Start selected mode**.
-4. Once completed, run **Add / update** under Indexing to incorporate the extracted content into the main search database.
-
----
-
-## Processing Pipeline Overview
-
-When a user submits a query, the application executes a four-stage process:
-
-1. **Understand Stage**:
-   * Analyzes the question.
-   * Generates search terms, optional query rewrites, and HyDE variants via the designated analysis LLM.
-
-2. **Retrieve Stage**:
-   * Performs hybrid lexical (BM25) and semantic vector search across the index.
-   * Merges multi-query search results using Reciprocal Rank Fusion (RRF).
-   * Passes the top candidates to the local cross-encoder reranker server.
-
-3. **Analyze Stage**:
-   * Evaluates candidate passages using the fast evidence analysis model.
-   * Generates factual summaries and classifies each item (`ANSWERS`, `PARTIAL`, `RELATED`, `OFFTOPIC`).
-   * Evaluates sufficiency at defined checkpoints. If information gaps exist, the engine formulates a revised query and initiates an additional retrieval wave.
-
-4. **Answer Stage**:
-   * Collects accepted evidence notes.
-   * Streams the structured response from the final answer LLM, enforcing inline citations `[1]`, `[2]`, etc.
-
----
-
-## API Reference
-
-### GET /api/status
-Returns index status, document counts, hardware details, and cache state.
-
-### GET /api/settings
-Returns active application configuration parameters.
-
-### POST /api/settings
-Updates application settings.
-* **Payload**: JSON object containing configuration keys to update.
-
-### GET /api/models
-Queries LM Studio to list available chat completion models.
-
-### GET /api/local-models
-Returns catalog information and status for local embedding and reranker servers.
-
-### POST /api/select-local-model
-Switches the active embedding or reranking model.
-* **Payload**: `{"kind": "embedding" | "reranker", "id": "<model_filename>"}`
-
-### POST /api/answer-stream
-Streams processing events, progress, and generated answers using Server-Sent Events (SSE).
-* **Payload**:
-  ```json
-  {
-    "query": "What are the flight departure times?",
-    "answer": true,
-    "adaptive": true
-  }
-  ```
-
-### POST /api/ingest-stream
-Triggers document scanning and vector ingestion via Server-Sent Events (SSE).
-* **Payload**: `{"mode": "incremental" | "full"}`
-
-### POST /api/pst/import
-Initiates an asynchronous PST extraction job.
-* **Payload**: `{"pst_path": "C:\\Path\\To\\Archive.pst"}`
-
-### GET /api/pst/status?job=<job_id>
-Polls status and progress of an active PST extraction task.
-
-### GET /api/document-text
-Extracts full text from a document or retrieves its saved snapshot.
-* **Query Parameters**: `path`, `document_id`, `offset`, `limit`
-
-### POST /api/document-relocate
-Attempts to match a missing document against a replacement folder using SHA-256 fingerprint matching.
-* **Payload**: `{"document_id": "<hash>", "folder": "D:\\NewLocation"}`
+4. After extraction finishes, run **Add / update** under Indexing to index the output folder.
 
 ---
 
 ## Configuration Reference
 
-Key application parameters stored in `data/settings.json`:
+Key application parameters (stored in `data/settings.json`):
 
-| Parameter | Default | Description |
+| Key | Default | Description |
 | :--- | :--- | :--- |
-| `source_folder` | Project parent | Path to document directory for indexing. |
-| `lmstudio_url` | `http://127.0.0.1:1234/v1` | URL endpoint for LM Studio server. |
-| `chunk_size` | `900` | Target passage chunk size in characters. |
-| `chunk_overlap` | `140` | Overlap between adjacent chunks in characters. |
-| `candidate_count` | `32` | Initial candidate passages retrieved per query variant. |
-| `rerank_count` | `4` | Number of analyzed passages per sufficiency checkpoint. |
-| `max_candidate_checks` | `24` | Maximum candidate passages analyzed per query. |
-| `semantic_weight` | `0.72` | Weighting factor assigned to semantic vector search. |
-| `keyword_weight` | `0.28` | Weighting factor assigned to BM25 keyword search. |
+| `source_folder` | Root Parent | Path to the directory containing documents for indexing. |
+| `lmstudio_url` | `http://127.0.0.1:1234/v1` | Endpoint for the local LM Studio server. |
+| `analysis_model` | `""` | LM Studio model key for query planning and passage analysis. |
+| `chat_model` | `""` | LM Studio model key for writing the final cited response. |
+| `embedding_model` | `nomic-embed-text-v1.5.Q4_K_M.gguf` | GGUF model file used for text vectorization. |
+| `rerank_model` | `bge-reranker-v2-m3-Q4_K_M.gguf` | GGUF model file used for cross-encoder reranking. |
+| `chunk_size` | `900` | Target passage size in characters. |
+| `chunk_overlap` | `140` | Character overlap between adjacent chunks. |
+| `candidate_count` | `32` | Candidate passages retrieved per search query. |
+| `rerank_count` | `4` | Passages evaluated per sufficiency assessment checkpoint. |
+| `max_candidate_checks` | `24` | Hard cap on total candidate passages evaluated per query. |
+| `semantic_weight` | `0.72` | Vector similarity weight in hybrid search. |
+| `keyword_weight` | `0.28` | BM25 keyword weight in hybrid search. |
 | `use_llm_rerank` | `true` | Enables BGE local cross-encoder reranking. |
-| `adaptive_rag` | `true` | Enables query rewrites, HyDE, and multi-wave search. |
-| `use_lancedb` | `true` | Uses LanceDB storage if package is installed. |
-| `gpu_offload` | `true` | Offloads llama-server layers to available GPU. |
+| `adaptive_rag` | `true` | Enables query rewrites, HyDE, and multi-wave corrective search. |
+| `use_lancedb` | `true` | Enables LanceDB vector storage when available. |
+| `gpu_offload` | `true` | Offloads llama-server model layers to available GPU hardware. |
 
 ---
 
-## Troubleshooting
+## API Endpoint Summary
 
-### Connection Error to Local Server
-* Verify `llama-server.exe` exists in the `runtime/` directory.
-* Check logs in `data/logs/embedding-server.log` or `data/logs/reranker-server.log`.
-
-### LM Studio Models Not Visible
-* Ensure the LM Studio local server is running on port `1234`.
-* Confirm at least one model is loaded in LM Studio.
-
-### Outlook PST Extraction Fails
-* Verify Microsoft Outlook desktop application is installed and configured on Windows.
-* Check required COM bindings by running `python -c "import win32com.client"`.
+* `GET /api/status`: Returns current document counts, memory index state, and hardware info.
+* `GET /api/settings` / `POST /api/settings`: Reads or updates configuration options.
+* `GET /api/models`: Queries LM Studio for available chat models.
+* `GET /api/local-models`: Reports operational status for embedded embedding and reranker servers.
+* `POST /api/select-local-model`: Switches active embedding or reranker models.
+* `POST /api/answer-stream`: Streams multi-stage execution updates and final cited answers via Server-Sent Events (SSE).
+* `POST /api/ingest-stream`: Streams progress events during document scanning and indexing.
+* `POST /api/pst/import`: Starts an asynchronous Outlook PST extraction task.
+* `GET /api/pst/status?job=<job_id>`: Returns status and progress for an active PST job.
+* `GET /api/document-text`: Retrieves full extracted text or snapshot for a document.
+* `POST /api/document-relocate`: Matches a missing document against a new folder using SHA-256 content fingerprints.
 
 ---
 
 ## License
 
-This project is open-source and available under the MIT License.
+This project is open-source and licensed under the MIT License.
+```
