@@ -358,29 +358,6 @@ This update improves retrieval accuracy and evidence usability, especially for s
 - **Improved citation navigation**  
   Clicking a citation in the generated answer automatically expands and scrolls to the corresponding evidence card.
 
-## Files Changed
-
-### `app.py`
-
-- Improved retrieval scoring
-- Added title and email-subject extraction
-- Added short-query title weighting
-- Updated retrieval settings behaviour
-- Added title and keyword-score metadata
-
-### `index.html`
-
-- Added collapsible evidence cards
-- Added extracted title display
-- Added keyboard accessibility
-- Updated retrieval settings guidance
-
-## Upgrade Notes
-
-1. Replace the existing `app.py` and `index.html` files.
-2. Restart the application once to load the updated code.
-3. Continue using the existing index—a complete index rebuild is not required for these fixes.
-
 ---
 
 ## License
