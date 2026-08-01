@@ -364,7 +364,7 @@ This update improves retrieval accuracy and evidence usability, especially for s
 
 - **Faster retrieval:** Added NumPy vector scoring, efficient keyword ranking, bounded reranking, and LRU caching.
 - **Improved reliability:** Fixed SSE streaming, duplicate ingestion routes, concurrent index loading, and Windows path matching.
-- **Better document support:** Improved support for PDF, XLSX, XLS, DOCX, PPTX, MSG, PST, CSV, JSON, Markdown, and text files.
+- **Better document support:** Improved support for PDF, XLSX, XLS, DOCX, PPTX, MSG, PST, CSV, JSON, EML, Markdown, and text files.
 - **Improved PDF extraction:** PyMuPDF is now preferred, with pypdf and local fallbacks.
 - **Enhanced interface:** Improved stream errors, stop behaviour, keyboard accessibility, mobile layout, and reduced-motion support.
 - **All-in-one installer:** Installs pip, LanceDB, NumPy, document dependencies, the embedding model, and the reranker model.
