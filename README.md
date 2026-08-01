@@ -347,7 +347,7 @@ This update improves retrieval accuracy and evidence usability, especially for s
   Matches in `THREAD SUBJECT`, `SUBJECT`, or the document filename receive more weight than matches found only in the body content.
 
 - **Short-query optimisation**  
-  One- and two-keyword searches, such as `APAC`, receive a stronger title and subject boost.
+  One- and two-keyword searches, receive a stronger title and subject boost.
 
 - **Exact phrase boost**  
   An exact phrase found in an email subject or document title receives additional relevance weight.
