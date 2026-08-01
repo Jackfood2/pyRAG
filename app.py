@@ -2202,7 +2202,7 @@ class Handler(SimpleHTTPRequestHandler):
         self.close_connection = True
         self._gone = False
         try:
-            self.wfile.write(b": stream open\n")
+            self.wfile.write(b": stream open\n\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):
             self._gone = True
@@ -2212,7 +2212,7 @@ class Handler(SimpleHTTPRequestHandler):
             return
         try:
             payload = json.dumps(json_safe(data), ensure_ascii=False)
-            self.wfile.write(f"data: {payload}\n".encode("utf-8"))
+            self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):
             self._gone = True
@@ -3150,10 +3150,6 @@ class Handler(SimpleHTTPRequestHandler):
                 return
 
 
-            if self.path == "/api/ingest-stream":
-                c = settings()
-                self._ingest_stream(c, body)
-                return
 
 
             if self.path == "/api/pst/import":
